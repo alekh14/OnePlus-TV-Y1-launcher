@@ -16,7 +16,15 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - uses: android-actions/setup-android@v3
+      # The runner image already ships the Android SDK; just accept licences and make sure API 34 exists.
+      - name: Prepare Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -1)
+          echo "using $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" "platforms;android-34" "build-tools;34.0.0" || true
+          echo "sdk.dir=$ANDROID_HOME" > launcher/local.properties
 
       - uses: gradle/actions/setup-gradle@v3
         with:
