@@ -15,6 +15,8 @@ import androidx.dynamicanimation.animation.SpringForce;
  */
 final class GlassView extends View {
     private float l, t, r, b, radius;
+    private final android.graphics.Rect dirty = new android.graphics.Rect();
+    private float dl, dt, dr, db;   // area drawn last frame
     private boolean placed;
     private final Paint fill = new Paint(Paint.ANTI_ALIAS_FLAG);
     private final Paint stroke = new Paint(Paint.ANTI_ALIAS_FLAG);
@@ -25,19 +27,19 @@ final class GlassView extends View {
 
     private static final FloatPropertyCompat<GlassView> L = new FloatPropertyCompat<GlassView>("l") {
         @Override public float getValue(GlassView o) { return o.l; }
-        @Override public void setValue(GlassView o, float v) { o.l = v; o.invalidate(); }
+        @Override public void setValue(GlassView o, float v) { o.l = v; o.redraw(); }
     };
     private static final FloatPropertyCompat<GlassView> T = new FloatPropertyCompat<GlassView>("t") {
         @Override public float getValue(GlassView o) { return o.t; }
-        @Override public void setValue(GlassView o, float v) { o.t = v; o.invalidate(); }
+        @Override public void setValue(GlassView o, float v) { o.t = v; o.redraw(); }
     };
     private static final FloatPropertyCompat<GlassView> R = new FloatPropertyCompat<GlassView>("r") {
         @Override public float getValue(GlassView o) { return o.r; }
-        @Override public void setValue(GlassView o, float v) { o.r = v; o.invalidate(); }
+        @Override public void setValue(GlassView o, float v) { o.r = v; o.redraw(); }
     };
     private static final FloatPropertyCompat<GlassView> B = new FloatPropertyCompat<GlassView>("b") {
         @Override public float getValue(GlassView o) { return o.b; }
-        @Override public void setValue(GlassView o, float v) { o.b = v; o.invalidate(); }
+        @Override public void setValue(GlassView o, float v) { o.b = v; o.redraw(); }
     };
 
     GlassView(Context ctx, float strokeWidth) {
@@ -71,7 +73,7 @@ final class GlassView extends View {
             cancelAll();
             l = nl; t = nt; r = nr; b = nb;
             placed = true;
-            invalidate();
+            redraw();
             return;
         }
         sl.animateToFinalPosition(nl);
@@ -87,9 +89,19 @@ final class GlassView extends View {
         if (sb.isRunning()) sb.cancel();
     }
 
+    /** Invalidate only the old and new highlight areas, not the whole screen-sized view. */
+    private void redraw() {
+        float pad = stroke.getStrokeWidth() + 4f;
+        float il = Math.min(l, dl) - pad, it = Math.min(t, dt) - pad;
+        float ir = Math.max(r, dr) + pad, ib = Math.max(b, db) + pad;
+        dirty.set((int) il, (int) it, (int) Math.ceil(ir), (int) Math.ceil(ib));
+        invalidate(dirty);
+    }
+
     @Override
     protected void onDraw(Canvas c) {
         if (!placed) return;
+        dl = l; dt = t; dr = r; db = b;
         c.drawRoundRect(l, t, r, b, radius, radius, fill);
         c.drawRoundRect(l, t, r, b, radius, radius, stroke);
     }
