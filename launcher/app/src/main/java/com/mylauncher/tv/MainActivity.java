@@ -2,6 +2,7 @@ package com.mylauncher.tv;
 
 import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
+import android.Manifest;
 import android.app.Activity;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
@@ -23,6 +24,7 @@ import android.graphics.RectF;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
 import android.graphics.drawable.GradientDrawable;
+import android.location.LocationManager;
 import android.media.tv.TvContract;
 import android.media.tv.TvInputInfo;
 import android.media.tv.TvInputManager;
@@ -30,6 +32,7 @@ import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.wifi.WifiInfo;
 import android.net.wifi.WifiManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -109,6 +112,8 @@ public class MainActivity extends Activity {
     private GridLayoutManager gridLm;
     private AppAdapter adapter;
     private LinearLayout menuPanel;
+    private View scrim;                 // dims the screen behind the app options box
+    private boolean menuBig = false;    // app options box uses bigger rows and text
     private final List<TextView> menuRows = new ArrayList<>();
     private final List<Runnable> menuActions = new ArrayList<>();
     private final List<Boolean> menuSelectable = new ArrayList<>();
@@ -173,9 +178,8 @@ public class MainActivity extends Activity {
                 if (d == null) return;
                 String n = i.getStringExtra(BluetoothDevice.EXTRA_NAME);
                 if (n == null) n = d.getName();
-                if (n == null || n.length() == 0) return;   // unnamed devices are never shown
-                btNames.put(d.getAddress(), n);
-                if (d.getBondState() != BluetoothDevice.BOND_BONDED && !btHas(d) && btFound.size() < 30) btFound.add(d);
+                if (n != null && n.length() > 0) btNames.put(d.getAddress(), n);
+                if (d.getBondState() != BluetoothDevice.BOND_BONDED && !btHas(d) && btFound.size() < 40) btFound.add(d);
                 scheduleBtRebuild();
             } else if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(a)) {
                 btScanning = true;
@@ -286,6 +290,7 @@ public class MainActivity extends Activity {
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         if (zone == Z_MENU) closeMenuQuiet();
+        if (editMode) exitEditMode();
         zone = dock.isEmpty() ? (grid.isEmpty() ? Z_TOP : Z_GRID) : Z_DOCK;
         if (zone == Z_DOCK && gridLm != null) gridLm.scrollToPositionWithOffset(0, 0);
         applyFocus(false);
@@ -294,6 +299,7 @@ public class MainActivity extends Activity {
     @Override
     public void onBackPressed() {
         if (zone == Z_MENU) { closeMenu(); return; }
+        if (editMode) { exitEditMode(); return; }
         if (zone == Z_GRID) { zone = Z_DOCK; applyFocus(true); saveState(); return; }
         if (zone == Z_TOP) { zone = Z_DOCK; applyFocus(true); return; }
         // On the dock a launcher never exits.
@@ -463,14 +469,20 @@ public class MainActivity extends Activity {
         });
         page.addView(rv, lp(W - 2 * margin, gridH, margin, gridTop));
 
+        // ---- dark layer behind the app options box ----
+        scrim = new View(this);
+        scrim.setBackgroundColor(0xC8000000);
+        scrim.setVisibility(View.GONE);
+        page.addView(scrim, new FrameLayout.LayoutParams(W, H));
+
         // ---- inputs dropdown (hidden until opened) ----
         menuPanel = new LinearLayout(this);
         menuPanel.setOrientation(LinearLayout.VERTICAL);
         menuPanel.setPadding((int) px(8), (int) px(8), (int) px(8), (int) px(8));
         GradientDrawable mbg = new GradientDrawable();
-        mbg.setColor(0xF01E1E21);
-        mbg.setStroke(Math.max(1, (int) px(1)), 0x33FFFFFF);
-        mbg.setCornerRadius(px(16));
+        mbg.setColor(0xFF2A2A2E);
+        mbg.setStroke(Math.max(2, (int) px(1.5f)), 0x77FFFFFF);
+        mbg.setCornerRadius(px(18));
         menuPanel.setBackground(mbg);
         menuPanel.setVisibility(View.GONE);
         page.addView(menuPanel, lp((int) px(230), ViewGroup.LayoutParams.WRAP_CONTENT, 0, 0));
@@ -671,6 +683,15 @@ public class MainActivity extends Activity {
     // =====================================================================================
 
     private boolean centerHeld = false, centerLong = false;
+    private boolean editMode = false;
+    private final Runnable longPressRunnable = new Runnable() {
+        @Override public void run() {
+            if (centerHeld && !centerLong && (zone == Z_DOCK || zone == Z_GRID)) {
+                centerLong = true;
+                openAppMenu();
+            }
+        }
+    };
 
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
@@ -679,20 +700,29 @@ public class MainActivity extends Activity {
                 || code == KeyEvent.KEYCODE_NUMPAD_ENTER || code == KeyEvent.KEYCODE_BUTTON_A;
         boolean arrow = code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN
                 || code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT;
-        if (!(center || arrow || code == KeyEvent.KEYCODE_MENU)) return super.dispatchKeyEvent(e);
+        // keys that open the app options directly (whichever your remote has)
+        boolean optionsKey = code == KeyEvent.KEYCODE_MENU || code == KeyEvent.KEYCODE_INFO
+                || code == KeyEvent.KEYCODE_TV_CONTENTS_MENU || code == KeyEvent.KEYCODE_PROG_YELLOW
+                || code == KeyEvent.KEYCODE_BUTTON_Y;
+        if (!(center || arrow || optionsKey)) return super.dispatchKeyEvent(e);
 
         int act = e.getAction();
         if (center) {
-            // OK acts on release, so that holding it can open the app options instead
+            // OK acts on release, so that holding it can open the app options instead.
+            // The hold is timed here (about half a second), so it works even if the remote sends no key repeats.
             if (act == KeyEvent.ACTION_DOWN) {
                 if (e.getRepeatCount() == 0) {
                     centerHeld = true;
                     centerLong = false;
+                    ui.removeCallbacks(longPressRunnable);
+                    ui.postDelayed(longPressRunnable, 550);
                 } else if (centerHeld && !centerLong && (zone == Z_DOCK || zone == Z_GRID)) {
+                    ui.removeCallbacks(longPressRunnable);
                     centerLong = true;
                     openAppMenu();
                 }
             } else if (act == KeyEvent.ACTION_UP) {
+                ui.removeCallbacks(longPressRunnable);
                 if (centerHeld && !centerLong) select();
                 centerHeld = false;
                 centerLong = false;
@@ -705,7 +735,7 @@ public class MainActivity extends Activity {
                 case KeyEvent.KEYCODE_DPAD_DOWN:  move(0, 1); break;
                 case KeyEvent.KEYCODE_DPAD_LEFT:  move(-1, 0); break;
                 case KeyEvent.KEYCODE_DPAD_RIGHT: move(1, 0); break;
-                default: openAppMenu(); break;   // Menu key
+                default: openAppMenu(); break;
             }
         }
         return true;   // we own every navigation key; Android's focus search never runs
@@ -772,12 +802,14 @@ public class MainActivity extends Activity {
                 if (topIdx == P_INPUTS) openMenu();
                 else if (topIdx == P_BT) openBtMenu();
                 else if (topIdx == P_WIFI) openSettings(Settings.ACTION_WIFI_SETTINGS);
-                else openSettings(Settings.ACTION_SETTINGS);
+                else openSettingsMenu();
                 break;
             case Z_DOCK:
+                if (editMode) { openAppMenu(); break; }
                 if (dockIdx < dock.size()) launch(dock.get(dockIdx));
                 break;
             case Z_GRID:
+                if (editMode) { openAppMenu(); break; }
                 launch(adapter.get(gridIdx));
                 break;
             case Z_MENU:
@@ -845,7 +877,7 @@ public class MainActivity extends Activity {
         adapter.setFocused(rv, gridMode ? gridIdx : -1);
         for (int i = 0; i < menuRows.size(); i++) {
             boolean sel = menuSelectable.get(i);
-            menuRows.get(i).setAlpha(!sel ? 0.55f : (zone == Z_MENU && i == menuIdx ? 1f : 0.75f));
+            menuRows.get(i).setAlpha(!sel ? 0.9f : (zone == Z_MENU && i == menuIdx ? 1f : 0.75f));
         }
         updateHero();
         moveGlass(animate);
@@ -950,6 +982,7 @@ public class MainActivity extends Activity {
         menuActions.clear();
         menuSelectable.clear();
         btMenu = false;
+        menuBig = false;
         menuOwner = P_INPUTS;
         menuReturnZone = Z_TOP;
 
@@ -1003,14 +1036,15 @@ public class MainActivity extends Activity {
 
     /** Adds one row to the open dropdown. Non-selectable rows are small section headings. */
     private void addMenuRow(String label, boolean selectable, Runnable action) {
-        TextView row = text(selectable ? 15 : 11, selectable ? Color.WHITE : 0xFFFFFFFF, fRegular);
+        TextView row = text(selectable ? (menuBig ? 18 : 15) : (menuBig ? 13 : 11),
+                selectable ? Color.WHITE : 0xFFB8B8C0, fRegular);
         row.setText(label);
         row.setSingleLine(true);
         row.setEllipsize(TextUtils.TruncateAt.END);
         row.setGravity(Gravity.CENTER_VERTICAL);
         row.setPadding((int) px(14), 0, (int) px(14), 0);
         menuPanel.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
-                (int) px(selectable ? 34 : 24)));
+                (int) px(selectable ? (menuBig ? 44 : 34) : (menuBig ? 30 : 24))));
         menuRows.add(row);
         menuActions.add(action);
         menuSelectable.add(selectable);
@@ -1027,6 +1061,8 @@ public class MainActivity extends Activity {
         p.topMargin = (int) (tmp.bottom + px(8));
         menuPanel.setLayoutParams(p);
         menuPanel.setVisibility(View.VISIBLE);
+        menuPanel.bringToFront();
+        glass.bringToFront();
     }
 
     private int nextSelectable(int from, int dir) {
@@ -1053,9 +1089,47 @@ public class MainActivity extends Activity {
         if (btMenu) stopScan();
         btMenu = false;
         menuPanel.setVisibility(View.GONE);
+        scrim.setVisibility(View.GONE);
         menuRows.clear();
         menuActions.clear();
         menuSelectable.clear();
+    }
+
+    private void openSettingsMenu() {
+        menuPanel.removeAllViews();
+        menuRows.clear();
+        menuActions.clear();
+        menuSelectable.clear();
+        btMenu = false;
+        menuBig = false;
+        menuReturnZone = Z_TOP;
+        addMenuRow("TV settings", true, new Runnable() {
+            @Override public void run() { closeMenu(); openSettings(Settings.ACTION_SETTINGS); }
+        });
+        addMenuRow(editMode ? "Finish editing apps" : "Edit dock apps", true, new Runnable() {
+            @Override public void run() {
+                closeMenu();
+                if (editMode) exitEditMode(); else enterEditMode();
+            }
+        });
+        showMenuPanel(P_SETTINGS, 240);
+        menuIdx = 0;
+        zone = Z_MENU;
+        menuPanel.post(new Runnable() { @Override public void run() { applyFocus(true); } });
+    }
+
+    /** Edit mode: OK on any app opens its options (add to dock, move, remove) instead of launching it. */
+    private void enterEditMode() {
+        editMode = true;
+        greeting.setText("Edit mode \u00B7 Back to finish");
+        zone = dock.isEmpty() ? Z_GRID : Z_DOCK;
+        applyFocus(true);
+        toast("Press OK on an app for options");
+    }
+
+    private void exitEditMode() {
+        editMode = false;
+        updateGreeting();
     }
 
     // =====================================================================================
@@ -1081,6 +1155,7 @@ public class MainActivity extends Activity {
         menuActions.clear();
         menuSelectable.clear();
         btMenu = false;
+        menuBig = true;
         menuReturnZone = zone;
 
         addMenuRow(e.label.toUpperCase(Locale.getDefault()), false, null);
@@ -1156,13 +1231,21 @@ public class MainActivity extends Activity {
 
         // centred on the screen (page coordinates move with the grid, so add its shift)
         menuOwner = -1;
-        int w = (int) px(300);
+        int w = (int) px(340);
+        int shift = (menuReturnZone == Z_GRID ? shiftPx : 0);   // the page is slid up in grid mode
+        FrameLayout.LayoutParams sp = (FrameLayout.LayoutParams) scrim.getLayoutParams();
+        sp.topMargin = shift;
+        scrim.setLayoutParams(sp);
+        scrim.setVisibility(View.VISIBLE);
+        scrim.bringToFront();
         FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) menuPanel.getLayoutParams();
         p.width = w;
         p.leftMargin = (W - w) / 2;
-        p.topMargin = (menuReturnZone == Z_GRID ? shiftPx : 0) + (int) (H * 0.22f);
+        p.topMargin = shift + (int) (H * 0.16f);
         menuPanel.setLayoutParams(p);
         menuPanel.setVisibility(View.VISIBLE);
+        menuPanel.bringToFront();
+        glass.bringToFront();
         menuIdx = firstSelectable();
         zone = Z_MENU;
         menuPanel.post(new Runnable() { @Override public void run() { applyFocus(true); } });
@@ -1274,6 +1357,7 @@ public class MainActivity extends Activity {
             return;
         }
         btFound.clear();
+        menuBig = false;
         menuReturnZone = Z_TOP;
         btMenu = true;
         menuIdx = 0;
@@ -1312,24 +1396,47 @@ public class MainActivity extends Activity {
         }
 
         List<BluetoothDevice> avail = new ArrayList<>();
+        List<BluetoothDevice> unnamed = new ArrayList<>();
         for (BluetoothDevice d : btFound) {
+            if (d.getBondState() == BluetoothDevice.BOND_BONDED) continue;
             String nm = null;
             try { nm = d.getName(); } catch (Throwable ignored) { }
             if (nm == null) nm = btNames.get(d.getAddress());
-            if (nm != null && nm.length() > 0 && d.getBondState() != BluetoothDevice.BOND_BONDED) avail.add(d);
+            if (nm != null && nm.length() > 0) avail.add(d); else unnamed.add(d);
         }
+        avail.addAll(unnamed);
         if (!avail.isEmpty()) {
-            addMenuRow("AVAILABLE – press OK to pair", false, null);
-            int n = 0;
+            addMenuRow("AVAILABLE \u2013 press OK to pair", false, null);
+            int shown = 0;
             for (final BluetoothDevice d : avail) {
-                if (n++ >= 5) break;
-                addMenuRow(btName(d), true, new Runnable() {
+                if (shown++ >= 5) break;
+                addMenuRow(btLabel(d), true, new Runnable() {
                     @Override public void run() { btPair(d); }
                 });
             }
+        } else if (!btHasPermission()) {
+            addMenuRow("LOCATION PERMISSION NEEDED", false, null);
+            addMenuRow("Allow location access", true, new Runnable() {
+                @Override public void run() { requestBtPermission(); }
+            });
         } else if (!btScanning) {
-            addMenuRow("NOTHING NEW FOUND", false, null);
-            addMenuRow("Put the device in pairing mode", false, null);
+            if (!locationOn()) {
+                addMenuRow("LOCATION IS OFF \u2013 NEEDED TO SEARCH", false, null);
+                addMenuRow("Turn Location on", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        try {
+                            startActivity(new Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+                                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+                        } catch (Throwable t) {
+                            toast("Open Settings > Device Preferences > Location");
+                        }
+                    }
+                });
+            } else {
+                addMenuRow("NOTHING NEW FOUND", false, null);
+                addMenuRow("Put the device in pairing mode", false, null);
+            }
         }
 
         addMenuRow("Bluetooth settings", true, new Runnable() {
@@ -1352,25 +1459,104 @@ public class MainActivity extends Activity {
         menuPanel.post(new Runnable() { @Override public void run() { if (btMenu) applyFocus(false); } });
     }
 
+    private final Runnable startDiscoveryRunnable = new Runnable() {
+        @Override public void run() { doStartDiscovery(); }
+    };
+
+    private boolean btHasPermission() {
+        if (Build.VERSION.SDK_INT < 23) return true;
+        try {
+            return checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
+    private void requestBtPermission() {
+        if (Build.VERSION.SDK_INT < 23) return;
+        try {
+            toast("Allow location so Bluetooth search can work");
+            requestPermissions(new String[]{Manifest.permission.ACCESS_FINE_LOCATION,
+                    Manifest.permission.ACCESS_COARSE_LOCATION}, 77);
+        } catch (Throwable t) {
+            toast("Could not ask for permission. See the README for the adb command.");
+        }
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode != 77) return;
+        if (btHasPermission()) {
+            if (btMenu) startScan();
+        } else {
+            toast("Bluetooth search needs the location permission");
+            if (btMenu) rebuildBtMenu();
+        }
+    }
+
+    /** Android hides Bluetooth search results while Location is switched off. */
+    private boolean locationOn() {
+        try {
+            if (Build.VERSION.SDK_INT >= 28) {
+                LocationManager lm = (LocationManager) getSystemService(Context.LOCATION_SERVICE);
+                return lm == null || lm.isLocationEnabled();
+            }
+            return Settings.Secure.getInt(getContentResolver(), Settings.Secure.LOCATION_MODE, 1) != 0;
+        } catch (Throwable t) {
+            return true;
+        }
+    }
+
     private void startScan() {
         try {
             if (bt == null || !bt.isEnabled()) return;
-            if (bt.isDiscovering()) bt.cancelDiscovery();
+            if (!btHasPermission()) {
+                requestBtPermission();
+                if (btMenu) rebuildBtMenu();
+                return;
+            }
+            if (bt.isDiscovering()) {
+                // a running search must finish cancelling before a new one can start
+                bt.cancelDiscovery();
+                ui.removeCallbacks(startDiscoveryRunnable);
+                ui.postDelayed(startDiscoveryRunnable, 700);
+                return;
+            }
+        } catch (Throwable t) {
+            // fall through and try to start anyway
+        }
+        doStartDiscovery();
+    }
+
+    private void doStartDiscovery() {
+        try {
+            if (bt == null || !bt.isEnabled()) return;
             btFound.clear();
             btScanning = bt.startDiscovery();
-            if (!btScanning) toast("Could not start searching. Turn Location on in the TV settings and try again.");
+            if (!btScanning) toast("Could not start searching. Try Bluetooth settings.");
         } catch (Throwable t) {
             btScanning = false;
-            toast("Searching is not allowed. Run the permission command from the README.");
+            toast("Searching is not allowed on this TV");
         }
         if (btMenu) rebuildBtMenu();
     }
 
     private void stopScan() {
+        ui.removeCallbacks(startDiscoveryRunnable);
         try {
             if (bt != null && bt.isDiscovering()) bt.cancelDiscovery();
         } catch (Throwable ignored) { }
         btScanning = false;
+    }
+
+    private String btLabel(BluetoothDevice d) {
+        String n = null;
+        try { n = d.getName(); } catch (Throwable ignored) { }
+        if (n == null || n.length() == 0) n = btNames.get(d.getAddress());
+        if (n != null && n.length() > 0) return n;
+        String a = d.getAddress();
+        return "Unknown device (" + (a != null && a.length() >= 5 ? a.substring(a.length() - 5) : "?") + ")";
     }
 
     private void btPair(BluetoothDevice d) {
@@ -1414,6 +1600,7 @@ public class MainActivity extends Activity {
     // =====================================================================================
 
     private void updateGreeting() {
+        if (editMode) return;
         int h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY);
         String g;
         if (h >= 5 && h < 12) g = "Good morning";
