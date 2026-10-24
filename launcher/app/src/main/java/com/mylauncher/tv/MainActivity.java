@@ -524,10 +524,10 @@ public class MainActivity extends Activity {
                     String base = (setting != null && setting.trim().length() > 0)
                             ? setting.trim() : TextUtils.join(",", DEFAULT_DOCK);
                     // Dock edits made on the remote (dockCustom) win, until scripts\4-set-dock.ps1 stores a different list.
-                    String seen = prefs.getString("dockBase", null);
+                    String lastBase = prefs.getString("dockBase", null);
                     String custom = prefs.getString("dockCustom", null);
                     String use;
-                    if (custom != null && base.equals(seen)) {
+                    if (custom != null && base.equals(lastBase)) {
                         use = custom;
                     } else {
                         use = base;
