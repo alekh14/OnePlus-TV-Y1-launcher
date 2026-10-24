@@ -1,0 +1,40 @@
+plugins {
+    id 'com.android.application'
+}
+
+// build-and-install.ps1 passes the TV's real API level: gradlew assembleDebug -PtvMinSdk=28
+def tvMinSdk = (project.findProperty('tvMinSdk') ?: '21') as int
+
+android {
+    namespace 'com.mylauncher.tv'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId 'com.mylauncher.tv'
+        minSdk tvMinSdk
+        targetSdk 28            // keeps Wi-Fi name / package queries simple on older TVs
+        versionCode 1
+        versionName '1.0'
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    lint {
+        abortOnError false
+        checkReleaseBuilds false
+    }
+}
+
+dependencies {
+    implementation 'androidx.recyclerview:recyclerview:1.3.2'
+    implementation 'androidx.dynamicanimation:dynamicanimation:1.0.0'
+}

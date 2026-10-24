@@ -1,0 +1,7 @@
+# Dock apps, left to right (max 4). One slot per line.
+# Several package names on a line (comma separated): the first one that is installed wins.
+# Change the order by moving lines, then run scripts\4-set-dock.ps1 (no rebuild needed).
+com.netflix.ninja
+com.google.android.youtube.tv
+com.amazon.amazonvideo.livingroom,com.amazon.avod
+in.startv.hotstar.dplus.tv,in.startv.hotstar

@@ -1,0 +1,25 @@
+# Packages to disable, chosen from your OnePlus Y1S package list. One per line.
+# Delete a line to keep that app. Run scripts\3-debloat.ps1 to see the plan, then -Apply.
+
+# Retail demo / factory / test tools (not needed in normal use)
+com.smartdevice.common.demonow
+fusion.android.tv.demo
+com.coocaa.factory
+com.mediatek.testpq
+
+# Manufacturer e-manual and first-boot partner auto-install
+com.Smartdevice.emanual
+android.autoinstalls.config.skyworth
+
+# Google extras you are not using
+com.google.android.play.games
+com.google.android.feedback
+
+# Stock launcher's recommendation row and partner rows (safe once your launcher is the default)
+com.google.android.tvrecommendations
+com.google.android.leanbacklauncher.partnercustomizer
+
+# Optional - uncomment to also disable:
+# com.google.android.backdrop              (Android TV ambient screensaver)
+# com.mstar.android.tv.disclaimercustomization
+# com.mediatek.tv.factory                  (factory menu)
