@@ -3,6 +3,9 @@ package com.mylauncher.tv;
 import android.animation.ArgbEvaluator;
 import android.animation.ValueAnimator;
 import android.app.Activity;
+import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
+import android.bluetooth.BluetoothProfile;
 import android.content.ActivityNotFoundException;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
@@ -52,7 +55,10 @@ import androidx.recyclerview.widget.LinearSmoothScroller;
 import androidx.recyclerview.widget.RecyclerView;
 
 import java.io.InputStream;
+import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Calendar;
 import java.util.Collections;
 import java.util.Comparator;
@@ -83,6 +89,7 @@ public class MainActivity extends Activity {
     private static final int MAX_DOCK = 4;
 
     private static final int Z_TOP = 0, Z_DOCK = 1, Z_GRID = 2, Z_MENU = 3;
+    private static final int P_INPUTS = 0, P_BT = 1, P_WIFI = 2, P_SETTINGS = 3;
 
     // ---- geometry ----
     private float u;
@@ -94,7 +101,7 @@ public class MainActivity extends Activity {
     private GlowView glow;
     private GlassView glass;
     private TextView greeting, heroName;
-    private final TextView[] pills = new TextView[3];
+    private final TextView[] pills = new TextView[4];
     private LinearLayout topBar;
     private View dockBand;
     private final List<ImageView> dockTiles = new ArrayList<>();
@@ -103,7 +110,17 @@ public class MainActivity extends Activity {
     private AppAdapter adapter;
     private LinearLayout menuPanel;
     private final List<TextView> menuRows = new ArrayList<>();
-    private final List<Intent> menuIntents = new ArrayList<>();
+    private final List<Runnable> menuActions = new ArrayList<>();
+    private final List<Boolean> menuSelectable = new ArrayList<>();
+    private int menuOwner = P_INPUTS;     // which top-bar pill the open dropdown belongs to (-1: app options box)
+    private int menuReturnZone = Z_TOP;   // where focus goes when the dropdown closes
+
+    // ---- bluetooth ----
+    private BluetoothAdapter bt;
+    private boolean btMenu = false;
+    private boolean btScanning = false;
+    private final List<BluetoothDevice> btFound = new ArrayList<>();
+    private final Map<String, String> btNames = new HashMap<>();
 
     // ---- state ----
     private int zone = Z_DOCK;
@@ -117,6 +134,18 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private Typeface fThin, fLight, fRegular;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    // finished tiles (small pre-rendered bitmaps) are kept, so coming back to Home costs almost nothing
+    private final java.util.concurrent.ConcurrentHashMap<String, AppEntry> entryCache =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private String lastSig = null;
+    private boolean lowRam = false;
+    private boolean btRebuildPending = false;
+    private final Runnable btRebuild = new Runnable() {
+        @Override public void run() { btRebuildPending = false; rebuildBtMenu(); }
+    };
+    private final Runnable saveRunnable = new Runnable() {
+        @Override public void run() { saveState(); }
+    };
     private final Handler ui = new Handler(Looper.getMainLooper());
     private final DecelerateInterpolator decel = new DecelerateInterpolator(1.6f);
     private ValueAnimator glowAnim;
@@ -127,12 +156,55 @@ public class MainActivity extends Activity {
 
     private final BroadcastReceiver pkgReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) {
+            entryCache.clear();
             ui.removeCallbacks(reloadApps);
             ui.postDelayed(reloadApps, 700);
         }
     };
     private final BroadcastReceiver netReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { updateWifiPill(); }
+    };
+    private final BroadcastReceiver btReceiver = new BroadcastReceiver() {
+        @Override public void onReceive(Context c, Intent i) {
+            String a = i.getAction();
+            if (a == null) return;
+            BluetoothDevice d = i.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE);
+            if (BluetoothDevice.ACTION_FOUND.equals(a) || BluetoothDevice.ACTION_NAME_CHANGED.equals(a)) {
+                if (d == null) return;
+                String n = i.getStringExtra(BluetoothDevice.EXTRA_NAME);
+                if (n == null) n = d.getName();
+                if (n == null || n.length() == 0) return;   // unnamed devices are never shown
+                btNames.put(d.getAddress(), n);
+                if (d.getBondState() != BluetoothDevice.BOND_BONDED && !btHas(d) && btFound.size() < 30) btFound.add(d);
+                scheduleBtRebuild();
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_STARTED.equals(a)) {
+                btScanning = true;
+                scheduleBtRebuild();
+            } else if (BluetoothAdapter.ACTION_DISCOVERY_FINISHED.equals(a)) {
+                btScanning = false;
+                scheduleBtRebuild();
+            } else if (BluetoothAdapter.ACTION_STATE_CHANGED.equals(a)) {
+                int st = i.getIntExtra(BluetoothAdapter.EXTRA_STATE, -1);
+                updateBtPill();
+                if (st == BluetoothAdapter.STATE_ON && btMenu) startScan();
+                else if (btMenu) rebuildBtMenu();
+            } else if (BluetoothDevice.ACTION_BOND_STATE_CHANGED.equals(a)) {
+                int now = i.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, -1);
+                int was = i.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, -1);
+                if (d != null && now == BluetoothDevice.BOND_BONDED) {
+                    toast("Paired with " + btName(d));
+                    btFound.remove(d);
+                } else if (d != null && now == BluetoothDevice.BOND_NONE && was == BluetoothDevice.BOND_BONDING) {
+                    toast("Pairing with " + btName(d) + " failed. Put it in pairing mode and try again.");
+                }
+                updateBtPill();
+                if (btMenu) rebuildBtMenu();
+            } else {
+                // ACL connected / disconnected, adapter connection state
+                updateBtPill();
+                if (btMenu) rebuildBtMenu();
+            }
+        }
     };
     private final BroadcastReceiver tickReceiver = new BroadcastReceiver() {
         @Override public void onReceive(Context c, Intent i) { updateGreeting(); }
@@ -150,6 +222,11 @@ public class MainActivity extends Activity {
         H = dm.heightPixels;
         u = H / 540f;
         prefs = getSharedPreferences("launcher", MODE_PRIVATE);
+        try { bt = BluetoothAdapter.getDefaultAdapter(); } catch (Throwable t) { bt = null; }
+        try {
+            android.app.ActivityManager am = (android.app.ActivityManager) getSystemService(ACTIVITY_SERVICE);
+            lowRam = am != null && (am.isLowRamDevice() || am.getMemoryClass() <= 128);
+        } catch (Throwable t) { lowRam = false; }
         loadTypefaces();
         computeGeometry();
         buildUi();
@@ -170,8 +247,20 @@ public class MainActivity extends Activity {
         registerReceiver(pkgReceiver, pf);
         registerReceiver(netReceiver, new IntentFilter(ConnectivityManager.CONNECTIVITY_ACTION));
         registerReceiver(tickReceiver, new IntentFilter(Intent.ACTION_TIME_TICK));
+        IntentFilter bf = new IntentFilter();
+        bf.addAction(BluetoothAdapter.ACTION_STATE_CHANGED);
+        bf.addAction(BluetoothAdapter.ACTION_DISCOVERY_STARTED);
+        bf.addAction(BluetoothAdapter.ACTION_DISCOVERY_FINISHED);
+        bf.addAction(BluetoothAdapter.ACTION_CONNECTION_STATE_CHANGED);
+        bf.addAction(BluetoothDevice.ACTION_FOUND);
+        bf.addAction(BluetoothDevice.ACTION_NAME_CHANGED);
+        bf.addAction(BluetoothDevice.ACTION_BOND_STATE_CHANGED);
+        bf.addAction(BluetoothDevice.ACTION_ACL_CONNECTED);
+        bf.addAction(BluetoothDevice.ACTION_ACL_DISCONNECTED);
+        registerReceiver(btReceiver, bf);
         updateGreeting();
         updateWifiPill();
+        updateBtPill();
         if (appsLoaded) loadApps();   // pick up changes made while we were away (e.g. dock setting)
     }
 
@@ -181,6 +270,8 @@ public class MainActivity extends Activity {
         try { unregisterReceiver(pkgReceiver); } catch (Exception ignored) { }
         try { unregisterReceiver(netReceiver); } catch (Exception ignored) { }
         try { unregisterReceiver(tickReceiver); } catch (Exception ignored) { }
+        try { unregisterReceiver(btReceiver); } catch (Exception ignored) { }
+        stopScan();
         saveState();
     }
 
@@ -267,10 +358,8 @@ public class MainActivity extends Activity {
             ImageView iv = new ImageView(this);
             iv.setScaleType(ImageView.ScaleType.CENTER_CROP);
             iv.setImageBitmap(wp);
+            iv.setColorFilter(0xAA000000, android.graphics.PorterDuff.Mode.SRC_OVER);
             root.addView(iv, new FrameLayout.LayoutParams(W, H));
-            View dim = new View(this);
-            dim.setBackgroundColor(0xAA000000);
-            root.addView(dim, new FrameLayout.LayoutParams(W, H));
         }
 
         page = new FrameLayout(this);
@@ -308,8 +397,8 @@ public class MainActivity extends Activity {
         // ---- top right: pills ----
         topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names = {"Inputs", "Wi-Fi", "Settings"};
-        for (int i = 0; i < 3; i++) {
+        String[] names = {"Inputs", "Bluetooth", "Wi-Fi", "Settings"};
+        for (int i = 0; i < names.length; i++) {
             TextView p = text(15, Color.WHITE, fRegular);
             p.setText(names[i]);
             p.setSingleLine(true);
@@ -432,8 +521,19 @@ public class MainActivity extends Activity {
                         }
                     });
                     String setting = Settings.Secure.getString(getContentResolver(), SECURE_DOCK_KEY);
-                    final String[] wanted = (setting != null && setting.trim().length() > 0)
-                            ? setting.split(",") : DEFAULT_DOCK;
+                    String base = (setting != null && setting.trim().length() > 0)
+                            ? setting.trim() : TextUtils.join(",", DEFAULT_DOCK);
+                    // Dock edits made on the remote (dockCustom) win, until scripts\4-set-dock.ps1 stores a different list.
+                    String seen = prefs.getString("dockBase", null);
+                    String custom = prefs.getString("dockCustom", null);
+                    String use;
+                    if (custom != null && base.equals(seen)) {
+                        use = custom;
+                    } else {
+                        use = base;
+                        prefs.edit().putString("dockBase", base).remove("dockCustom").apply();
+                    }
+                    final String[] wanted = use.split(",");
                     final List<AppEntry> dockList = new ArrayList<>();
                     for (String w : wanted) {
                         String pkg = w.trim();
@@ -460,6 +560,8 @@ public class MainActivity extends Activity {
         for (ResolveInfo ri : ris) {
             String pkg = ri.activityInfo.packageName;
             if (pkg.equals(getPackageName()) || !seen.add(pkg)) continue;
+            AppEntry cached = entryCache.get(pkg);
+            if (cached != null) { out.add(cached); continue; }
             AppEntry e = new AppEntry();
             e.pkg = pkg;
             e.component = new ComponentName(pkg, ri.activityInfo.name);
@@ -483,13 +585,30 @@ public class MainActivity extends Activity {
                 src = ri.loadIcon(pm);
                 isBanner = false;
             }
-            e.tile = new TileDrawable(src, isBanner, px(14));
             e.glow = ColorSampler.sample(src);
+            Drawable live = new TileDrawable(src, isBanner, px(14));
+            Bitmap baked = null;
+            try {
+                baked = Bitmap.createBitmap(tileW, tileH, Bitmap.Config.ARGB_8888);
+                live.setBounds(0, 0, tileW, tileH);
+                live.draw(new android.graphics.Canvas(baked));
+                e.tile = new android.graphics.drawable.BitmapDrawable(getResources(), baked);
+            } catch (Throwable t) {
+                e.tile = live;   // out of memory: fall back to drawing the source directly
+            }
+            entryCache.put(pkg, e);
             out.add(e);
         }
     }
 
     private void onAppsLoaded(List<AppEntry> dockList, List<AppEntry> gridList, String keepPkg) {
+        StringBuilder sb = new StringBuilder();
+        for (AppEntry a : dockList) sb.append(a.pkg).append(',');
+        sb.append('|');
+        for (AppEntry a : gridList) sb.append(a.pkg).append(',');
+        String sig = sb.toString();
+        if (appsLoaded && sig.equals(lastSig)) return;   // same apps: leave the screen alone
+        lastSig = sig;
         dock = dockList;
         grid = gridList;
         adapter.setItems(grid);
@@ -551,21 +670,42 @@ public class MainActivity extends Activity {
     // key handling
     // =====================================================================================
 
+    private boolean centerHeld = false, centerLong = false;
+
     @Override
     public boolean dispatchKeyEvent(KeyEvent e) {
         int code = e.getKeyCode();
-        boolean nav = code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN
-                || code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT
-                || code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
+        boolean center = code == KeyEvent.KEYCODE_DPAD_CENTER || code == KeyEvent.KEYCODE_ENTER
                 || code == KeyEvent.KEYCODE_NUMPAD_ENTER || code == KeyEvent.KEYCODE_BUTTON_A;
-        if (!nav) return super.dispatchKeyEvent(e);
-        if (e.getAction() == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
+        boolean arrow = code == KeyEvent.KEYCODE_DPAD_UP || code == KeyEvent.KEYCODE_DPAD_DOWN
+                || code == KeyEvent.KEYCODE_DPAD_LEFT || code == KeyEvent.KEYCODE_DPAD_RIGHT;
+        if (!(center || arrow || code == KeyEvent.KEYCODE_MENU)) return super.dispatchKeyEvent(e);
+
+        int act = e.getAction();
+        if (center) {
+            // OK acts on release, so that holding it can open the app options instead
+            if (act == KeyEvent.ACTION_DOWN) {
+                if (e.getRepeatCount() == 0) {
+                    centerHeld = true;
+                    centerLong = false;
+                } else if (centerHeld && !centerLong && (zone == Z_DOCK || zone == Z_GRID)) {
+                    centerLong = true;
+                    openAppMenu();
+                }
+            } else if (act == KeyEvent.ACTION_UP) {
+                if (centerHeld && !centerLong) select();
+                centerHeld = false;
+                centerLong = false;
+            }
+            return true;
+        }
+        if (act == KeyEvent.ACTION_DOWN && e.getRepeatCount() == 0) {
             switch (code) {
                 case KeyEvent.KEYCODE_DPAD_UP:    move(0, -1); break;
                 case KeyEvent.KEYCODE_DPAD_DOWN:  move(0, 1); break;
                 case KeyEvent.KEYCODE_DPAD_LEFT:  move(-1, 0); break;
                 case KeyEvent.KEYCODE_DPAD_RIGHT: move(1, 0); break;
-                default: select(); break;
+                default: openAppMenu(); break;   // Menu key
             }
         }
         return true;   // we own every navigation key; Android's focus search never runs
@@ -616,20 +756,22 @@ public class MainActivity extends Activity {
                 if (zone == Z_GRID) scrollGridTo(gridIdx);
                 break;
             case Z_MENU:
-                if (dy != 0) menuIdx = clamp(menuIdx + dy, 0, Math.max(0, menuRows.size() - 1));
+                if (dy != 0) menuIdx = nextSelectable(menuIdx, dy);
                 break;
             default:
                 break;
         }
         applyFocus(true);
-        saveState();
+        ui.removeCallbacks(saveRunnable);
+        ui.postDelayed(saveRunnable, 2000);
     }
 
     private void select() {
         switch (zone) {
             case Z_TOP:
-                if (topIdx == 0) openMenu();
-                else if (topIdx == 1) openSettings(Settings.ACTION_WIFI_SETTINGS);
+                if (topIdx == P_INPUTS) openMenu();
+                else if (topIdx == P_BT) openBtMenu();
+                else if (topIdx == P_WIFI) openSettings(Settings.ACTION_WIFI_SETTINGS);
                 else openSettings(Settings.ACTION_SETTINGS);
                 break;
             case Z_DOCK:
@@ -639,14 +781,8 @@ public class MainActivity extends Activity {
                 launch(adapter.get(gridIdx));
                 break;
             case Z_MENU:
-                if (menuIdx >= 0 && menuIdx < menuIntents.size()) {
-                    Intent i = menuIntents.get(menuIdx);
-                    closeMenu();
-                    try {
-                        startActivity(i);
-                    } catch (Throwable t) {
-                        toast("Nothing on this TV can open that input");
-                    }
+                if (menuIdx >= 0 && menuIdx < menuActions.size() && menuActions.get(menuIdx) != null) {
+                    menuActions.get(menuIdx).run();
                 }
                 break;
             default:
@@ -684,10 +820,10 @@ public class MainActivity extends Activity {
     // =====================================================================================
 
     private void applyFocus(boolean animate) {
-        boolean gridMode = zone == Z_GRID;
+        boolean gridMode = zone == Z_GRID || (zone == Z_MENU && menuReturnZone == Z_GRID);
         float ty = gridMode ? -shiftPx : 0f;
         if (animate) {
-            page.animate().translationY(ty).setDuration(300).setInterpolator(decel).start();
+            page.animate().translationY(ty).setDuration(lowRam ? 220 : 300).setInterpolator(decel).withLayer().start();
             rv.animate().alpha(gridMode ? 1f : 0f).setDuration(260).start();
         } else {
             page.animate().cancel();
@@ -701,14 +837,15 @@ public class MainActivity extends Activity {
         for (int i = 0; i < pills.length; i++) {
             boolean on = zone == Z_TOP && i == topIdx;
             scale(pills[i], on ? 1.06f : 1f, animate);
-            pills[i].setAlpha(on || (zone == Z_MENU && i == 0) ? 1f : 0.85f);
+            pills[i].setAlpha(on || (zone == Z_MENU && i == menuOwner) ? 1f : 0.85f);
         }
         for (int i = 0; i < dockTiles.size(); i++) {
             scale(dockTiles.get(i), (zone == Z_DOCK && i == dockIdx) ? 1.08f : 1f, animate);
         }
         adapter.setFocused(rv, gridMode ? gridIdx : -1);
         for (int i = 0; i < menuRows.size(); i++) {
-            menuRows.get(i).setAlpha(zone == Z_MENU && i == menuIdx ? 1f : 0.7f);
+            boolean sel = menuSelectable.get(i);
+            menuRows.get(i).setAlpha(!sel ? 0.55f : (zone == Z_MENU && i == menuIdx ? 1f : 0.75f));
         }
         updateHero();
         moveGlass(animate);
@@ -737,6 +874,7 @@ public class MainActivity extends Activity {
     private void animateGlow(int target) {
         int from = glow.getColor();
         if (from == target) return;
+        if (lowRam) { glow.setColor(target); return; }
         if (glowAnim != null) glowAnim.cancel();
         glowAnim = ValueAnimator.ofObject(new ArgbEvaluator(), from, target);
         glowAnim.setDuration(380);
@@ -809,7 +947,11 @@ public class MainActivity extends Activity {
     private void openMenu() {
         menuPanel.removeAllViews();
         menuRows.clear();
-        menuIntents.clear();
+        menuActions.clear();
+        menuSelectable.clear();
+        btMenu = false;
+        menuOwner = P_INPUTS;
+        menuReturnZone = Z_TOP;
 
         List<String> labels = new ArrayList<>();
         List<Intent> intents = new ArrayList<>();
@@ -835,48 +977,436 @@ public class MainActivity extends Activity {
         Collections.sort(order, new Comparator<Integer>() {
             @Override public int compare(Integer a, Integer b) { return lbl.get(a).compareToIgnoreCase(lbl.get(b)); }
         });
-        List<String> sl = new ArrayList<>();
-        List<Intent> si = new ArrayList<>();
-        for (int idx : order) { sl.add(labels.get(idx)); si.add(intents.get(idx)); }
-        sl.add("Live TV");
+        for (int idx : order) addInputRow(labels.get(idx), intents.get(idx));
         Intent live = new Intent(Intent.ACTION_VIEW, TvContract.Channels.CONTENT_URI);
         live.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        si.add(live);
+        addInputRow("Live TV", live);
 
-        for (int i = 0; i < sl.size(); i++) {
-            TextView row = text(15, Color.WHITE, fRegular);
-            row.setText(sl.get(i));
-            row.setSingleLine(true);
-            row.setEllipsize(TextUtils.TruncateAt.END);
-            row.setGravity(Gravity.CENTER_VERTICAL);
-            row.setPadding((int) px(14), 0, (int) px(14), 0);
-            menuPanel.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, (int) px(38)));
-            menuRows.add(row);
-            menuIntents.add(si.get(i));
-        }
+        showMenuPanel(P_INPUTS, 230);
+        menuIdx = 0;
+        zone = Z_MENU;
+        menuPanel.post(new Runnable() { @Override public void run() { applyFocus(true); } });
+    }
 
-        rectInPage(pills[0], tmp);
+    private void addInputRow(String label, final Intent intent) {
+        addMenuRow(label, true, new Runnable() {
+            @Override public void run() {
+                closeMenu();
+                try {
+                    startActivity(intent);
+                } catch (Throwable t) {
+                    toast("Nothing on this TV can open that input");
+                }
+            }
+        });
+    }
+
+    /** Adds one row to the open dropdown. Non-selectable rows are small section headings. */
+    private void addMenuRow(String label, boolean selectable, Runnable action) {
+        TextView row = text(selectable ? 15 : 11, selectable ? Color.WHITE : 0xFFFFFFFF, fRegular);
+        row.setText(label);
+        row.setSingleLine(true);
+        row.setEllipsize(TextUtils.TruncateAt.END);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        row.setPadding((int) px(14), 0, (int) px(14), 0);
+        menuPanel.addView(row, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                (int) px(selectable ? 34 : 24)));
+        menuRows.add(row);
+        menuActions.add(action);
+        menuSelectable.add(selectable);
+    }
+
+    /** Place the dropdown under a top-bar pill, kept inside the screen. */
+    private void showMenuPanel(int pillIndex, int widthUnits) {
+        menuOwner = pillIndex;
+        rectInPage(pills[pillIndex], tmp);
+        int w = (int) px(widthUnits);
         FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) menuPanel.getLayoutParams();
-        p.leftMargin = (int) tmp.left;
+        p.width = w;
+        p.leftMargin = (int) Math.max(margin, Math.min(tmp.left, W - margin - w));
         p.topMargin = (int) (tmp.bottom + px(8));
         menuPanel.setLayoutParams(p);
         menuPanel.setVisibility(View.VISIBLE);
-        zone = Z_MENU;
-        menuIdx = 0;
-        // the rows have no size until the next layout pass
-        menuPanel.post(new Runnable() { @Override public void run() { applyFocus(true); } });
+    }
+
+    private int nextSelectable(int from, int dir) {
+        int i = from + dir;
+        while (i >= 0 && i < menuRows.size()) {
+            if (menuSelectable.get(i)) return i;
+            i += dir;
+        }
+        return from;
+    }
+
+    private int firstSelectable() {
+        for (int i = 0; i < menuSelectable.size(); i++) if (menuSelectable.get(i)) return i;
+        return 0;
     }
 
     private void closeMenu() {
         closeMenuQuiet();
-        zone = Z_TOP;
+        zone = menuReturnZone;
         applyFocus(true);
     }
 
     private void closeMenuQuiet() {
+        if (btMenu) stopScan();
+        btMenu = false;
         menuPanel.setVisibility(View.GONE);
         menuRows.clear();
-        menuIntents.clear();
+        menuActions.clear();
+        menuSelectable.clear();
+    }
+
+    // =====================================================================================
+    // app options box (hold OK or press Menu) and dock editing
+    // =====================================================================================
+
+    private void openAppMenu() {
+        final AppEntry e;
+        final boolean inDock;
+        if (zone == Z_GRID) {
+            e = adapter.get(gridIdx);
+            inDock = false;
+        } else if (zone == Z_DOCK && dockIdx < dock.size()) {
+            e = dock.get(dockIdx);
+            inDock = true;
+        } else {
+            return;
+        }
+        if (e == null) return;
+
+        menuPanel.removeAllViews();
+        menuRows.clear();
+        menuActions.clear();
+        menuSelectable.clear();
+        btMenu = false;
+        menuReturnZone = zone;
+
+        addMenuRow(e.label.toUpperCase(Locale.getDefault()), false, null);
+        addMenuRow("Open", true, new Runnable() {
+            @Override public void run() { closeMenu(); launch(e); }
+        });
+        if (!inDock) {
+            if (dock.size() < MAX_DOCK) {
+                addMenuRow("Add to dock", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        l.add(e.pkg);
+                        saveDock(l, l.size() - 1);
+                        toast(e.label + " added to the dock");
+                    }
+                });
+            } else {
+                for (int k = 0; k < dock.size(); k++) {
+                    final int slot = k;
+                    addMenuRow("Replace " + dock.get(k).label + " in dock", true, new Runnable() {
+                        @Override public void run() {
+                            closeMenu();
+                            List<String> l = dockPkgs();
+                            l.set(slot, e.pkg);
+                            saveDock(l, slot);
+                            toast(e.label + " is now in the dock");
+                        }
+                    });
+                }
+            }
+        } else {
+            final int idx = dockIdx;
+            if (idx > 0) {
+                addMenuRow("Move left", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        Collections.swap(l, idx, idx - 1);
+                        saveDock(l, idx - 1);
+                    }
+                });
+            }
+            if (idx < dock.size() - 1) {
+                addMenuRow("Move right", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        Collections.swap(l, idx, idx + 1);
+                        saveDock(l, idx + 1);
+                    }
+                });
+            }
+            if (dock.size() > 1) {
+                addMenuRow("Remove from dock", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        l.remove(idx);
+                        saveDock(l, Math.min(idx, l.size() - 1));
+                    }
+                });
+            }
+            addMenuRow("Reset dock to default", true, new Runnable() {
+                @Override public void run() {
+                    closeMenu();
+                    prefs.edit().remove("dockCustom").apply();
+                    dockIdx = 0;
+                    loadApps();
+                }
+            });
+        }
+
+        // centred on the screen (page coordinates move with the grid, so add its shift)
+        menuOwner = -1;
+        int w = (int) px(300);
+        FrameLayout.LayoutParams p = (FrameLayout.LayoutParams) menuPanel.getLayoutParams();
+        p.width = w;
+        p.leftMargin = (W - w) / 2;
+        p.topMargin = (menuReturnZone == Z_GRID ? shiftPx : 0) + (int) (H * 0.22f);
+        menuPanel.setLayoutParams(p);
+        menuPanel.setVisibility(View.VISIBLE);
+        menuIdx = firstSelectable();
+        zone = Z_MENU;
+        menuPanel.post(new Runnable() { @Override public void run() { applyFocus(true); } });
+    }
+
+    private List<String> dockPkgs() {
+        List<String> l = new ArrayList<>();
+        for (AppEntry a : dock) l.add(a.pkg);
+        return l;
+    }
+
+    private void saveDock(List<String> pkgs, int newDockIdx) {
+        prefs.edit().putString("dockCustom", TextUtils.join(",", pkgs)).apply();
+        dockIdx = Math.max(0, newDockIdx);
+        loadApps();
+    }
+
+    // =====================================================================================
+    // bluetooth: pill, scan, pair, connect
+    // =====================================================================================
+
+    private String btName(BluetoothDevice d) {
+        String n = null;
+        try { n = d.getName(); } catch (Throwable ignored) { }
+        if (n == null || n.length() == 0) n = btNames.get(d.getAddress());
+        if (n == null || n.length() == 0) n = d.getAddress();
+        return n;
+    }
+
+    private void scheduleBtRebuild() {
+        if (!btMenu || btRebuildPending) return;
+        btRebuildPending = true;
+        ui.postDelayed(btRebuild, 250);
+    }
+
+    private boolean btHas(BluetoothDevice d) {
+        for (BluetoothDevice x : btFound) if (x.getAddress().equals(d.getAddress())) return true;
+        return false;
+    }
+
+    /** BluetoothDevice.isConnected() is hidden but works on Android TV 9-11 through reflection. */
+    private boolean btConnected(BluetoothDevice d) {
+        try {
+            Method m = d.getClass().getMethod("isConnected");
+            return (Boolean) m.invoke(d);
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    private List<BluetoothDevice> bondedSorted() {
+        List<BluetoothDevice> list = new ArrayList<>();
+        try {
+            if (bt != null && bt.isEnabled()) list.addAll(bt.getBondedDevices());
+        } catch (Throwable ignored) { }
+        Collections.sort(list, new Comparator<BluetoothDevice>() {
+            @Override public int compare(BluetoothDevice a, BluetoothDevice b) {
+                boolean ca = btConnected(a), cb = btConnected(b);
+                if (ca != cb) return ca ? -1 : 1;
+                return btName(a).compareToIgnoreCase(btName(b));
+            }
+        });
+        return list;
+    }
+
+    private void updateBtPill() {
+        String t;
+        try {
+            if (bt == null) {
+                t = "Bluetooth · Not available";
+            } else if (!bt.isEnabled()) {
+                t = "Bluetooth · Off";
+            } else {
+                List<BluetoothDevice> bonded = bondedSorted();
+                List<String> on = new ArrayList<>();
+                for (BluetoothDevice d : bonded) if (btConnected(d)) on.add(btName(d));
+                if (!on.isEmpty()) {
+                    String first = on.get(0);
+                    if (first.length() > 16) first = first.substring(0, 15) + "…";
+                    t = "Bluetooth · " + first + (on.size() > 1 ? " +" + (on.size() - 1) : "");
+                } else if (bonded.isEmpty()) {
+                    t = "Bluetooth · Add device";
+                } else {
+                    t = "Bluetooth · Not connected";
+                }
+            }
+        } catch (Throwable e) {
+            t = "Bluetooth";
+        }
+        pills[P_BT].setText(t);
+        page.post(new Runnable() { @Override public void run() { if (zone == Z_TOP) moveGlass(false); } });
+    }
+
+    private void openBtMenu() {
+        if (bt == null) {
+            toast("This TV has no Bluetooth");
+            return;
+        }
+        try {
+            if (!bt.isEnabled()) {
+                toast("Turning Bluetooth on…");
+                if (!bt.enable()) {
+                    openSettings(Settings.ACTION_BLUETOOTH_SETTINGS);
+                    return;
+                }
+            }
+        } catch (Throwable t) {
+            openSettings(Settings.ACTION_BLUETOOTH_SETTINGS);
+            return;
+        }
+        btFound.clear();
+        menuReturnZone = Z_TOP;
+        btMenu = true;
+        menuIdx = 0;
+        zone = Z_MENU;
+        rebuildBtMenu();
+        menuIdx = firstSelectable();
+        startScan();   // searching starts by itself - no extra button press needed
+    }
+
+    private void rebuildBtMenu() {
+        if (!btMenu) return;
+        String keep = (menuIdx >= 0 && menuIdx < menuRows.size()) ? menuRows.get(menuIdx).getText().toString() : null;
+        menuPanel.removeAllViews();
+        menuRows.clear();
+        menuActions.clear();
+        menuSelectable.clear();
+
+        addMenuRow(btScanning ? "Searching… (press OK to restart)" : "Search for devices", true, new Runnable() {
+            @Override public void run() { startScan(); }
+        });
+
+        final List<BluetoothDevice> paired = bondedSorted();
+        if (!paired.isEmpty()) {
+            addMenuRow("PAIRED", false, null);
+            int n = 0;
+            for (final BluetoothDevice d : paired) {
+                if (n++ >= 4) break;
+                final boolean on = btConnected(d);
+                addMenuRow(btName(d) + (on ? "   ✓" : ""), true, new Runnable() {
+                    @Override public void run() {
+                        if (on) toast(btName(d) + " is connected");
+                        else btConnect(d);
+                    }
+                });
+            }
+        }
+
+        List<BluetoothDevice> avail = new ArrayList<>();
+        for (BluetoothDevice d : btFound) {
+            String nm = null;
+            try { nm = d.getName(); } catch (Throwable ignored) { }
+            if (nm == null) nm = btNames.get(d.getAddress());
+            if (nm != null && nm.length() > 0 && d.getBondState() != BluetoothDevice.BOND_BONDED) avail.add(d);
+        }
+        if (!avail.isEmpty()) {
+            addMenuRow("AVAILABLE – press OK to pair", false, null);
+            int n = 0;
+            for (final BluetoothDevice d : avail) {
+                if (n++ >= 5) break;
+                addMenuRow(btName(d), true, new Runnable() {
+                    @Override public void run() { btPair(d); }
+                });
+            }
+        } else if (!btScanning) {
+            addMenuRow("NOTHING NEW FOUND", false, null);
+            addMenuRow("Put the device in pairing mode", false, null);
+        }
+
+        addMenuRow("Bluetooth settings", true, new Runnable() {
+            @Override public void run() {
+                closeMenu();
+                openSettings(Settings.ACTION_BLUETOOTH_SETTINGS);
+            }
+        });
+
+        showMenuPanel(P_BT, 300);
+        int found = -1;
+        if (keep != null) {
+            for (int i = 0; i < menuRows.size(); i++) {
+                if (menuSelectable.get(i) && menuRows.get(i).getText().toString().equals(keep)) { found = i; break; }
+            }
+        }
+        if (found >= 0) menuIdx = found;
+        else menuIdx = clamp(menuIdx, 0, Math.max(0, menuRows.size() - 1));
+        if (menuIdx < menuSelectable.size() && !menuSelectable.get(menuIdx)) menuIdx = firstSelectable();
+        menuPanel.post(new Runnable() { @Override public void run() { if (btMenu) applyFocus(false); } });
+    }
+
+    private void startScan() {
+        try {
+            if (bt == null || !bt.isEnabled()) return;
+            if (bt.isDiscovering()) bt.cancelDiscovery();
+            btFound.clear();
+            btScanning = bt.startDiscovery();
+            if (!btScanning) toast("Could not start searching. Turn Location on in the TV settings and try again.");
+        } catch (Throwable t) {
+            btScanning = false;
+            toast("Searching is not allowed. Run the permission command from the README.");
+        }
+        if (btMenu) rebuildBtMenu();
+    }
+
+    private void stopScan() {
+        try {
+            if (bt != null && bt.isDiscovering()) bt.cancelDiscovery();
+        } catch (Throwable ignored) { }
+        btScanning = false;
+    }
+
+    private void btPair(BluetoothDevice d) {
+        try {
+            stopScan();
+            toast("Pairing with " + btName(d) + "…");
+            if (!d.createBond()) toast("Could not start pairing");
+        } catch (Throwable t) {
+            toast("Pairing failed. Use Bluetooth settings.");
+        }
+        if (btMenu) rebuildBtMenu();
+    }
+
+    /**
+     * Best-effort connect of an already paired device. Remotes and keyboards (HID) reconnect when you
+     * wake them; audio devices need an explicit connect, which is a hidden API on the profile proxy.
+     */
+    private void btConnect(final BluetoothDevice d) {
+        toast("Connecting to " + btName(d) + "… (wake it if it is a remote)");
+        int[] profiles = {BluetoothProfile.A2DP, BluetoothProfile.HEADSET, 4 /* HID host, hidden */};
+        for (int p : profiles) {
+            try {
+                bt.getProfileProxy(this, new BluetoothProfile.ServiceListener() {
+                    @Override public void onServiceConnected(int profile, BluetoothProfile proxy) {
+                        try {
+                            Method m = proxy.getClass().getMethod("connect", BluetoothDevice.class);
+                            m.invoke(proxy, d);
+                        } catch (Throwable ignored) {
+                        } finally {
+                            try { bt.closeProfileProxy(profile, proxy); } catch (Throwable ignored) { }
+                        }
+                    }
+                    @Override public void onServiceDisconnected(int profile) { }
+                }, p);
+            } catch (Throwable ignored) { }
+        }
     }
 
     // =====================================================================================
@@ -895,7 +1425,7 @@ public class MainActivity extends Activity {
 
     private void updateWifiPill() {
         String t = networkLabel();
-        pills[1].setText(t);
+        pills[P_WIFI].setText(t);
         // the pill changed width, so the highlight may need to follow
         page.post(new Runnable() { @Override public void run() { if (zone == Z_TOP) moveGlass(false); } });
     }
@@ -914,7 +1444,7 @@ public class MainActivity extends Activity {
                 if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length() >= 2) {
                     ssid = ssid.substring(1, ssid.length() - 1);
                 }
-                if (ssid.length() > 22) ssid = ssid.substring(0, 21) + "…";
+                if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "…";
                 return "Wi-Fi · " + ssid;
             }
             return "Wi-Fi · Connected";
@@ -929,7 +1459,7 @@ public class MainActivity extends Activity {
 
     private void readSavedState() {
         dockIdx = prefs.getInt("dockIdx", 0);
-        topIdx = clamp(prefs.getInt("topIdx", 0), 0, 2);
+        topIdx = clamp(prefs.getInt("topIdx", 0), 0, pills.length - 1);
         pendingGridPkg = prefs.getString("gridPkg", null);
         pendingZone = prefs.getInt("zone", Z_DOCK);
     }
