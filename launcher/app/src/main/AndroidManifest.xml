@@ -8,6 +8,10 @@
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <!-- Needed on newer Android to read the Wi-Fi network name; granted by build-and-install.ps1 -->
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+    <!-- Bluetooth pill: list paired devices, search for new ones, pair -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
 
     <application
         android:allowBackup="false"
