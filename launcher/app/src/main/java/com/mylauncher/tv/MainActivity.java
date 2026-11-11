@@ -106,6 +106,8 @@ public class MainActivity extends Activity {
     private TextView greeting, heroName;
     private final TextView[] pills = new TextView[4];
     private LinearLayout topBar;
+    private IconDrawable wifiIcon, btIcon;
+    private int iconPx;
     private View dockBand;
     private final List<ImageView> dockTiles = new ArrayList<>();
     private RecyclerView rv;
@@ -423,6 +425,13 @@ public class MainActivity extends Activity {
             topBar.addView(p, plp);
             pills[i] = p;
         }
+        iconPx = (int) px(22);
+        wifiIcon = new IconDrawable(IconDrawable.WIFI, Color.WHITE);
+        btIcon = new IconDrawable(IconDrawable.BLUETOOTH, Color.WHITE);
+        pills[P_BT].setContentDescription("Bluetooth");
+        pills[P_WIFI].setContentDescription("Wi-Fi");
+        setPillContent(pills[P_BT], btIcon, 0.6f, "");
+        setPillContent(pills[P_WIFI], wifiIcon, 0.6f, "");
         FrameLayout.LayoutParams tlp = new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.TOP | Gravity.END);
@@ -1312,31 +1321,46 @@ public class MainActivity extends Activity {
     }
 
     private void updateBtPill() {
-        String t;
+        String text = "";
+        float iconAlpha = 0.6f;
         try {
             if (bt == null) {
-                t = "Bluetooth · Not available";
+                iconAlpha = 0.3f;
             } else if (!bt.isEnabled()) {
-                t = "Bluetooth · Off";
+                iconAlpha = 0.4f;          // Bluetooth is off
             } else {
                 List<BluetoothDevice> bonded = bondedSorted();
                 List<String> on = new ArrayList<>();
                 for (BluetoothDevice d : bonded) if (btConnected(d)) on.add(btName(d));
                 if (!on.isEmpty()) {
                     String first = on.get(0);
-                    if (first.length() > 16) first = first.substring(0, 15) + "…";
-                    t = "Bluetooth · " + first + (on.size() > 1 ? " +" + (on.size() - 1) : "");
+                    if (first.length() > 16) first = first.substring(0, 15) + "\u2026";
+                    text = first + (on.size() > 1 ? " +" + (on.size() - 1) : "");
+                    iconAlpha = 1f;        // something is connected
                 } else if (bonded.isEmpty()) {
-                    t = "Bluetooth · Add device";
-                } else {
-                    t = "Bluetooth · Not connected";
+                    text = "Add device";   // nothing paired yet
+                    iconAlpha = 0.85f;
                 }
             }
         } catch (Throwable e) {
-            t = "Bluetooth";
+            iconAlpha = 0.6f;
         }
-        pills[P_BT].setText(t);
+        setPillContent(pills[P_BT], btIcon, iconAlpha, text);
         page.post(new Runnable() { @Override public void run() { if (zone == Z_TOP) moveGlass(false); } });
+    }
+
+    /** A pill shows an icon (dimmed when inactive) and, when there is one, a short name after it. */
+    private void setPillContent(TextView pill, IconDrawable icon, float iconAlpha, String text) {
+        if (icon != null) {
+            icon.setAlpha((int) (255 * iconAlpha));
+            icon.setBounds(0, 0, iconPx, iconPx);
+            pill.setCompoundDrawablesRelative(icon, null, null, null);
+            pill.setCompoundDrawablePadding(text.length() > 0 ? (int) px(8) : 0);
+        } else {
+            pill.setCompoundDrawablesRelative(null, null, null, null);
+            pill.setCompoundDrawablePadding(0);
+        }
+        pill.setText(text);
     }
 
     private void openBtMenu() {
@@ -1611,33 +1635,37 @@ public class MainActivity extends Activity {
     }
 
     private void updateWifiPill() {
-        String t = networkLabel();
-        pills[P_WIFI].setText(t);
-        // the pill changed width, so the highlight may need to follow
-        page.post(new Runnable() { @Override public void run() { if (zone == Z_TOP) moveGlass(false); } });
-    }
-
-    private String networkLabel() {
+        String name = "";
+        boolean connected = false;
+        boolean ethernet = false;
         try {
             Context app = getApplicationContext();
             ConnectivityManager cm = (ConnectivityManager) app.getSystemService(Context.CONNECTIVITY_SERVICE);
             NetworkInfo ni = cm.getActiveNetworkInfo();
-            if (ni == null || !ni.isConnected()) return "Wi-Fi · Not connected";
-            if (ni.getType() == ConnectivityManager.TYPE_ETHERNET) return "Ethernet";
-            WifiManager wm = (WifiManager) app.getSystemService(Context.WIFI_SERVICE);
-            WifiInfo wi = wm != null ? wm.getConnectionInfo() : null;
-            String ssid = wi != null ? wi.getSSID() : null;
-            if (ssid != null && !ssid.equals("<unknown ssid>") && !ssid.equals("0x") && ssid.length() > 0) {
-                if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length() >= 2) {
-                    ssid = ssid.substring(1, ssid.length() - 1);
+            if (ni != null && ni.isConnected()) {
+                connected = true;
+                if (ni.getType() == ConnectivityManager.TYPE_ETHERNET) {
+                    ethernet = true;
+                } else {
+                    WifiManager wm = (WifiManager) app.getSystemService(Context.WIFI_SERVICE);
+                    WifiInfo wi = wm != null ? wm.getConnectionInfo() : null;
+                    String ssid = wi != null ? wi.getSSID() : null;
+                    if (ssid != null && !ssid.equals("<unknown ssid>") && !ssid.equals("0x") && ssid.length() > 0) {
+                        if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length() >= 2) {
+                            ssid = ssid.substring(1, ssid.length() - 1);
+                        }
+                        if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "\u2026";
+                        name = ssid;
+                    }
                 }
-                if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "…";
-                return "Wi-Fi · " + ssid;
             }
-            return "Wi-Fi · Connected";
         } catch (Throwable t) {
-            return "Wi-Fi";
+            // keep the dimmed icon
         }
+        if (ethernet) setPillContent(pills[P_WIFI], null, 1f, "Ethernet");
+        else setPillContent(pills[P_WIFI], wifiIcon, connected ? 1f : 0.4f, name);
+        // the pill changed width, so the highlight may need to follow
+        page.post(new Runnable() { @Override public void run() { if (zone == Z_TOP) moveGlass(false); } });
     }
 
     // =====================================================================================
