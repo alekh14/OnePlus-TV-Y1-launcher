@@ -89,10 +89,10 @@ public class MainActivity extends Activity {
             "in.startv.hotstar.dplus.tv"
     };
     private static final int COLS = 4;
-    private static final int MAX_DOCK = 4;
+    private static final int MAX_DOCK = 8, DOCK_VISIBLE = 4;
 
     private static final int Z_TOP = 0, Z_DOCK = 1, Z_GRID = 2, Z_MENU = 3;
-    private static final int P_INPUTS = 0, P_BT = 1, P_WIFI = 2, P_SETTINGS = 3;
+    private static final int P_SWITCH = 0, P_INPUTS = 1, P_BT = 2, P_WIFI = 3, P_SETTINGS = 4;
 
     // ---- geometry ----
     private float u;
@@ -104,9 +104,12 @@ public class MainActivity extends Activity {
     private GlowView glow;
     private GlassView glass;
     private TextView greeting, heroName;
-    private final TextView[] pills = new TextView[4];
+    private final TextView[] pills = new TextView[5];
     private LinearLayout topBar;
-    private IconDrawable wifiIcon, btIcon;
+    private IconDrawable wifiIcon, btIcon, gearIcon, gridIcon, dockIcon;
+    private boolean allTab = false;      // false: dock tab, true: all-applications tab
+    private int dockOffset = 0;           // first dock app that is visible (the dock shows 4 of up to 8)
+    private TextView dockInfo;
     private int iconPx;
     private View dockBand;
     private final List<ImageView> dockTiles = new ArrayList<>();
@@ -141,6 +144,23 @@ public class MainActivity extends Activity {
     private SharedPreferences prefs;
     private Typeface fThin, fLight, fRegular;
     private final ExecutorService io = Executors.newSingleThreadExecutor();
+    private PhotoTile photoTile;          // the live photo tile in the grid
+    private AppEntry photoEntry;
+    private final Runnable photoTick = new Runnable() {
+        @Override public void run() {
+            // only change photos while the tile can actually be seen: first grid row, on screen
+            boolean show;
+            if (allTab) {
+                show = gridLm != null && !grid.isEmpty() && grid.get(0) == photoEntry
+                        && gridLm.findFirstVisibleItemPosition() == 0;
+            } else {
+                int pi = dock.indexOf(photoEntry);
+                show = pi >= dockOffset && pi < dockOffset + DOCK_VISIBLE;
+            }
+            if (show) photoTile.next();
+            ui.postDelayed(this, 8000);
+        }
+    };
     // finished tiles (small pre-rendered bitmaps) are kept, so coming back to Home costs almost nothing
     private final java.util.concurrent.ConcurrentHashMap<String, AppEntry> entryCache =
             new java.util.concurrent.ConcurrentHashMap<>();
@@ -235,6 +255,13 @@ public class MainActivity extends Activity {
         } catch (Throwable t) { lowRam = false; }
         loadTypefaces();
         computeGeometry();
+        photoTile = new PhotoTile(getApplicationContext(), tileW, tileH, px(14));
+        photoEntry = new AppEntry();
+        photoEntry.label = "Photos";
+        photoEntry.pkg = "launcher.photos";
+        photoEntry.isPhoto = true;
+        photoEntry.tile = photoTile.getDrawable();
+        photoEntry.glow = ColorSampler.FALLBACK;
         buildUi();
         readSavedState();
         setContentView(root);
@@ -244,6 +271,9 @@ public class MainActivity extends Activity {
     @Override
     protected void onStart() {
         super.onStart();
+        photoTile.refresh();
+        ui.removeCallbacks(photoTick);
+        ui.postDelayed(photoTick, 8000);
         IntentFilter pf = new IntentFilter();
         pf.addAction(Intent.ACTION_PACKAGE_ADDED);
         pf.addAction(Intent.ACTION_PACKAGE_REMOVED);
@@ -277,6 +307,7 @@ public class MainActivity extends Activity {
         try { unregisterReceiver(netReceiver); } catch (Exception ignored) { }
         try { unregisterReceiver(tickReceiver); } catch (Exception ignored) { }
         try { unregisterReceiver(btReceiver); } catch (Exception ignored) { }
+        ui.removeCallbacks(photoTick);
         stopScan();
         saveState();
     }
@@ -285,6 +316,7 @@ public class MainActivity extends Activity {
     protected void onDestroy() {
         super.onDestroy();
         io.shutdownNow();
+        if (photoTile != null) photoTile.shutdown();
     }
 
     /** Home button pressed while we are already running: go back to the dock. */
@@ -293,8 +325,14 @@ public class MainActivity extends Activity {
         super.onNewIntent(intent);
         if (zone == Z_MENU) closeMenuQuiet();
         if (editMode) exitEditMode();
-        zone = dock.isEmpty() ? (grid.isEmpty() ? Z_TOP : Z_GRID) : Z_DOCK;
-        if (zone == Z_DOCK && gridLm != null) gridLm.scrollToPositionWithOffset(0, 0);
+        if (!dock.isEmpty()) {
+            allTab = false;
+            zone = Z_DOCK;
+        } else {
+            allTab = true;
+            zone = grid.isEmpty() ? Z_TOP : Z_GRID;
+        }
+        updateSwitchPill();
         applyFocus(false);
     }
 
@@ -302,8 +340,8 @@ public class MainActivity extends Activity {
     public void onBackPressed() {
         if (zone == Z_MENU) { closeMenu(); return; }
         if (editMode) { exitEditMode(); return; }
-        if (zone == Z_GRID) { zone = Z_DOCK; applyFocus(true); saveState(); return; }
-        if (zone == Z_TOP) { zone = Z_DOCK; applyFocus(true); return; }
+        if (zone == Z_GRID) { if (!dock.isEmpty()) setTab(false, Z_DOCK); saveState(); return; }
+        if (zone == Z_TOP) { zone = allTab ? Z_GRID : Z_DOCK; applyFocus(true); return; }
         // On the dock a launcher never exits.
     }
 
@@ -334,7 +372,7 @@ public class MainActivity extends Activity {
         tileH = tileW * 9 / 16;
         bandH = tileH + (int) px(28);
         bandTop = H - bandH - (int) px(28);
-        shiftPx = bandTop - (int) px(36);
+        shiftPx = 0;   // the page no longer slides: the grid lives on its own tab
     }
 
     private TextView text(float sizeUnits, int color, Typeface tf) {
@@ -405,7 +443,7 @@ public class MainActivity extends Activity {
         // ---- top right: pills ----
         topBar = new LinearLayout(this);
         topBar.setOrientation(LinearLayout.HORIZONTAL);
-        String[] names = {"Inputs", "Bluetooth", "Wi-Fi", "Settings"};
+        String[] names = {"", "Inputs", "", "", ""};
         for (int i = 0; i < names.length; i++) {
             TextView p = text(15, Color.WHITE, fRegular);
             p.setText(names[i]);
@@ -428,6 +466,13 @@ public class MainActivity extends Activity {
         iconPx = (int) px(22);
         wifiIcon = new IconDrawable(IconDrawable.WIFI, Color.WHITE);
         btIcon = new IconDrawable(IconDrawable.BLUETOOTH, Color.WHITE);
+        gearIcon = new IconDrawable(IconDrawable.GEAR, Color.WHITE);
+        gridIcon = new IconDrawable(IconDrawable.GRID, Color.WHITE);
+        dockIcon = new IconDrawable(IconDrawable.DOCK, Color.WHITE);
+        pills[P_SETTINGS].setContentDescription("Settings");
+        pills[P_SWITCH].setContentDescription("Switch between dock and all apps");
+        setPillContent(pills[P_SETTINGS], gearIcon, 1f, "");
+        updateSwitchPill();
         pills[P_BT].setContentDescription("Bluetooth");
         pills[P_WIFI].setContentDescription("Wi-Fi");
         setPillContent(pills[P_BT], btIcon, 0.6f, "");
@@ -454,11 +499,15 @@ public class MainActivity extends Activity {
         dockBand.setBackground(band);
         page.addView(dockBand, lp(W - 2 * margin, bandH, margin, bandTop));
 
-        // ---- grid ----
-        int gridTop = bandTop + bandH + (int) px(20);
+        dockInfo = text(13, 0x99FFFFFF, fRegular);
+        dockInfo.setGravity(Gravity.CENTER);
+        dockInfo.setVisibility(View.GONE);
+        page.addView(dockInfo, lp(W - 2 * margin, ViewGroup.LayoutParams.WRAP_CONTENT, margin, bandTop + bandH + (int) px(6)));
+
+        // ---- all-applications grid (its own tab, below the clock) ----
+        int gridTop = (int) px(170);
         int cellH = tileH + (int) px(44);
-        int onScreenTop = gridTop - shiftPx;
-        int gridH = H - onScreenTop - (int) px(6);
+        int gridH = H - gridTop - (int) px(6);
         adapter = new AppAdapter(cellW, cellH, tileW, tileH, (int) px(8), (int) px(8) + tileH + (int) px(10),
                 px(15), fRegular);
         rv = new RecyclerView(this);
@@ -558,13 +607,18 @@ public class MainActivity extends Activity {
                     final List<AppEntry> dockList = new ArrayList<>();
                     for (String w : wanted) {
                         String pkg = w.trim();
-                        for (AppEntry e : list) {
-                            if (e.pkg.equals(pkg)) { dockList.add(e); break; }
+                        if (photoEntry.pkg.equals(pkg)) {
+                            if (!dockList.contains(photoEntry)) dockList.add(photoEntry);
+                        } else {
+                            for (AppEntry e : list) {
+                                if (e.pkg.equals(pkg) && !dockList.contains(e)) { dockList.add(e); break; }
+                            }
                         }
                         if (dockList.size() >= MAX_DOCK) break;
                     }
                     final List<AppEntry> gridList = new ArrayList<>(list);
                     gridList.removeAll(dockList);
+                    if (!dockList.contains(photoEntry)) gridList.add(0, photoEntry);
                     ui.post(new Runnable() {
                         @Override public void run() { onAppsLoaded(dockList, gridList, keepPkg); }
                     });
@@ -642,16 +696,25 @@ public class MainActivity extends Activity {
                 int gi = adapter.indexOfPackage(pendingGridPkg);
                 if (gi >= 0) gridIdx = gi;
             }
-            zone = (pendingZone == Z_GRID && !grid.isEmpty()) ? Z_GRID : Z_DOCK;
+            zone = Z_DOCK;
         } else if (keepPkg != null) {
             int gi = adapter.indexOfPackage(keepPkg);
             if (gi >= 0) gridIdx = gi;
         }
         dockIdx = Math.max(0, Math.min(dockIdx, dock.size() - 1));
         gridIdx = Math.max(0, Math.min(gridIdx, grid.size() - 1));
-        if (dock.isEmpty() && zone == Z_DOCK) zone = grid.isEmpty() ? Z_TOP : Z_GRID;
-        if (grid.isEmpty() && zone == Z_GRID) zone = dock.isEmpty() ? Z_TOP : Z_DOCK;
-        if (zone == Z_GRID) gridLm.scrollToPositionWithOffset(gridIdx, 0);
+        if (dock.isEmpty() && !allTab) {
+            allTab = true;
+            zone = grid.isEmpty() ? Z_TOP : Z_GRID;
+            updateSwitchPill();
+        } else if (grid.isEmpty() && allTab && !dock.isEmpty()) {
+            allTab = false;
+            zone = Z_DOCK;
+            updateSwitchPill();
+        }
+        if (zone == Z_GRID && !allTab) zone = Z_DOCK;
+        if (zone == Z_DOCK && allTab) zone = Z_GRID;
+        if (allTab) gridLm.scrollToPositionWithOffset(gridIdx, 0);
 
         page.post(new Runnable() {
             @Override public void run() { applyFocus(false); }
@@ -668,14 +731,65 @@ public class MainActivity extends Activity {
             iv.setScaleType(ImageView.ScaleType.FIT_XY);
             iv.setImageDrawable(dock.get(i).tile);
             iv.setFocusable(false);
-            int left = margin + i * cellW + (cellW - tileW) / 2;
+            int left = margin + (cellW - tileW) / 2;   // slot 0; layoutDock() shifts the others
             page.addView(iv, glassIndex + i, lp(tileW, tileH, left, top));
             dockTiles.add(iv);
         }
+        layoutDock();
+    }
+
+    /** Keep the focused dock app inside the 4 visible slots. */
+    private void ensureDockVisible() {
+        int maxOff = Math.max(0, dock.size() - DOCK_VISIBLE);
+        if (dockIdx < dockOffset) dockOffset = dockIdx;
+        if (dockIdx >= dockOffset + DOCK_VISIBLE) dockOffset = dockIdx - DOCK_VISIBLE + 1;
+        dockOffset = clamp(dockOffset, 0, maxOff);
+    }
+
+    /** Slide dock tiles into the visible slots; the others are hidden. */
+    private void layoutDock() {
+        ensureDockVisible();
+        for (int i = 0; i < dockTiles.size(); i++) {
+            ImageView v = dockTiles.get(i);
+            int slot = i - dockOffset;
+            v.setTranslationX(slot * cellW);
+            v.setVisibility(!allTab && slot >= 0 && slot < DOCK_VISIBLE ? View.VISIBLE : View.INVISIBLE);
+        }
+        if (dock.size() > DOCK_VISIBLE) {
+            dockInfo.setText((dockOffset > 0 ? "\u2039   " : "     ") + (dockIdx + 1) + " / " + dock.size()
+                    + (dockOffset + DOCK_VISIBLE < dock.size() ? "   \u203A" : "     "));
+            dockInfo.setVisibility(allTab ? View.GONE : View.VISIBLE);
+        } else {
+            dockInfo.setVisibility(View.GONE);
+        }
+    }
+
+    private void updateSwitchPill() {
+        setPillContent(pills[P_SWITCH], allTab ? dockIcon : gridIcon, 1f, allTab ? "Dock" : "All apps");
+    }
+
+    /** Switch between the dock tab and the all-applications tab. */
+    private void setTab(boolean all, int newZone) {
+        if (all && grid.isEmpty()) { toast("No other apps"); return; }
+        if (!all && dock.isEmpty()) { toast("The dock is empty. Add apps from All apps."); return; }
+        allTab = all;
+        zone = newZone;
+        updateSwitchPill();
+        if (all) {
+            gridIdx = clamp(gridIdx, 0, Math.max(0, grid.size() - 1));
+            gridLm.scrollToPositionWithOffset(gridIdx, 0);
+        }
+        applyFocus(false);
+        rv.post(new Runnable() { @Override public void run() { moveGlass(false); } });
     }
 
     private void launch(AppEntry e) {
         if (e == null) return;
+        if (e.isPhoto) {
+            if (photoTile.hasPhotos()) photoTile.next();
+            else toast("No photos yet. See the README to add some.");
+            return;
+        }
         try {
             Intent i = new Intent(Intent.ACTION_MAIN);
             i.addCategory(Intent.CATEGORY_LEANBACK_LAUNCHER);
@@ -756,18 +870,20 @@ public class MainActivity extends Activity {
                 if (dx != 0) {
                     topIdx = clamp(topIdx + dx, 0, pills.length - 1);   // ends stay put
                 } else if (dy > 0) {
-                    if (!dock.isEmpty()) zone = Z_DOCK;
-                    else if (!grid.isEmpty()) zone = Z_GRID;
+                    if (allTab && !grid.isEmpty()) zone = Z_GRID;
+                    else if (!allTab && !dock.isEmpty()) zone = Z_DOCK;
                 }
                 break;
             case Z_DOCK:
                 if (dx != 0) {
                     dockIdx = clamp(dockIdx + dx, 0, Math.max(0, dock.size() - 1));
+                    layoutDock();
                 } else if (dy < 0) {
                     zone = Z_TOP;
                 } else if (dy > 0 && !grid.isEmpty()) {
-                    zone = Z_GRID;
-                    gridIdx = Math.min(dockIdx, grid.size() - 1);   // straight down, first row
+                    gridIdx = Math.min(dockIdx - dockOffset, grid.size() - 1);   // same column, first row
+                    setTab(true, Z_GRID);
+                    return;
                 }
                 break;
             case Z_GRID:
@@ -778,8 +894,8 @@ public class MainActivity extends Activity {
                     if (nc >= 0 && nc < COLS && ni >= 0 && ni < grid.size()) gridIdx = ni;
                 } else if (dy < 0) {
                     if (gridIdx < COLS) {
-                        zone = dock.isEmpty() ? Z_TOP : Z_DOCK;
-                        if (!dock.isEmpty()) dockIdx = Math.min(gridIdx % COLS, dock.size() - 1);
+                        zone = Z_TOP;          // top row of All apps: up goes to the switch button
+                        topIdx = P_SWITCH;
                     } else {
                         gridIdx -= COLS;
                     }
@@ -808,7 +924,10 @@ public class MainActivity extends Activity {
     private void select() {
         switch (zone) {
             case Z_TOP:
-                if (topIdx == P_INPUTS) openMenu();
+                if (topIdx == P_SWITCH) {
+                    if (allTab) setTab(false, Z_TOP); else setTab(true, Z_TOP);
+                }
+                else if (topIdx == P_INPUTS) openMenu();
                 else if (topIdx == P_BT) openBtMenu();
                 else if (topIdx == P_WIFI) openSettings(Settings.ACTION_WIFI_SETTINGS);
                 else openSettingsMenu();
@@ -861,17 +980,15 @@ public class MainActivity extends Activity {
     // =====================================================================================
 
     private void applyFocus(boolean animate) {
-        boolean gridMode = zone == Z_GRID || (zone == Z_MENU && menuReturnZone == Z_GRID);
-        float ty = gridMode ? -shiftPx : 0f;
-        if (animate) {
-            page.animate().translationY(ty).setDuration(lowRam ? 220 : 300).setInterpolator(decel).withLayer().start();
-            rv.animate().alpha(gridMode ? 1f : 0f).setDuration(260).start();
-        } else {
-            page.animate().cancel();
-            rv.animate().cancel();
-            page.setTranslationY(ty);
-            rv.setAlpha(gridMode ? 1f : 0f);
-        }
+        boolean gridMode = allTab;
+        page.animate().cancel();
+        page.setTranslationY(0f);
+        rv.animate().cancel();
+        rv.setAlpha(gridMode ? 1f : 0f);
+        dockBand.setVisibility(gridMode ? View.GONE : View.VISIBLE);
+        heroName.setVisibility(gridMode ? View.GONE : View.VISIBLE);
+        glow.setVisibility(gridMode ? View.GONE : View.VISIBLE);
+        layoutDock();
 
         if (zone != Z_MENU && menuPanel.getVisibility() == View.VISIBLE) closeMenuQuiet();
 
@@ -883,7 +1000,7 @@ public class MainActivity extends Activity {
         for (int i = 0; i < dockTiles.size(); i++) {
             scale(dockTiles.get(i), (zone == Z_DOCK && i == dockIdx) ? 1.08f : 1f, animate);
         }
-        adapter.setFocused(rv, gridMode ? gridIdx : -1);
+        adapter.setFocused(rv, (gridMode && (zone == Z_GRID || (zone == Z_MENU && menuReturnZone == Z_GRID))) ? gridIdx : -1);
         for (int i = 0; i < menuRows.size(); i++) {
             boolean sel = menuSelectable.get(i);
             menuRows.get(i).setAlpha(!sel ? 0.9f : (zone == Z_MENU && i == menuIdx ? 1f : 0.75f));
@@ -903,7 +1020,7 @@ public class MainActivity extends Activity {
     }
 
     private void updateHero() {
-        if (dock.isEmpty()) {
+        if (dock.isEmpty() || allTab) {
             heroName.setText("");
             return;
         }
@@ -932,8 +1049,8 @@ public class MainActivity extends Activity {
         float x = 0, y = 0;
         View cur = v;
         while (cur != page) {
-            x += cur.getLeft();
-            y += cur.getTop();
+            x += cur.getLeft() + cur.getTranslationX();
+            y += cur.getTop() + cur.getTranslationY();
             ViewParent p = cur.getParent();
             if (!(p instanceof View)) break;
             cur = (View) p;
@@ -1131,7 +1248,7 @@ public class MainActivity extends Activity {
     private void enterEditMode() {
         editMode = true;
         greeting.setText("Edit mode \u00B7 Back to finish");
-        zone = dock.isEmpty() ? Z_GRID : Z_DOCK;
+        zone = allTab ? (grid.isEmpty() ? Z_TOP : Z_GRID) : (dock.isEmpty() ? Z_TOP : Z_DOCK);
         applyFocus(true);
         toast("Press OK on an app for options");
     }
@@ -1168,7 +1285,7 @@ public class MainActivity extends Activity {
         menuReturnZone = zone;
 
         addMenuRow(e.label.toUpperCase(Locale.getDefault()), false, null);
-        addMenuRow("Open", true, new Runnable() {
+        addMenuRow(e.isPhoto ? "Next photo" : "Open", true, new Runnable() {
             @Override public void run() { closeMenu(); launch(e); }
         });
         if (!inDock) {
@@ -1183,18 +1300,18 @@ public class MainActivity extends Activity {
                     }
                 });
             } else {
-                for (int k = 0; k < dock.size(); k++) {
-                    final int slot = k;
-                    addMenuRow("Replace " + dock.get(k).label + " in dock", true, new Runnable() {
-                        @Override public void run() {
-                            closeMenu();
-                            List<String> l = dockPkgs();
-                            l.set(slot, e.pkg);
-                            saveDock(l, slot);
-                            toast(e.label + " is now in the dock");
-                        }
-                    });
-                }
+                final int slot = dock.size() - 1;
+                addMenuRow("Dock is full (" + MAX_DOCK + ")", false, null);
+                addMenuRow("Replace " + dock.get(slot).label, true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        l.set(slot, e.pkg);
+                        saveDock(l, slot);
+                        toast(e.label + " is now in the dock");
+                    }
+                });
+                addMenuRow("Or remove one on the Dock tab", false, null);
             }
         } else {
             final int idx = dockIdx;
@@ -1237,6 +1354,7 @@ public class MainActivity extends Activity {
                 }
             });
         }
+
 
         // centred on the screen (page coordinates move with the grid, so add its shift)
         menuOwner = -1;
@@ -1334,7 +1452,7 @@ public class MainActivity extends Activity {
                 for (BluetoothDevice d : bonded) if (btConnected(d)) on.add(btName(d));
                 if (!on.isEmpty()) {
                     String first = on.get(0);
-                    if (first.length() > 16) first = first.substring(0, 15) + "\u2026";
+                    if (first.length() > 12) first = first.substring(0, 11) + "\u2026";
                     text = first + (on.size() > 1 ? " +" + (on.size() - 1) : "");
                     iconAlpha = 1f;        // something is connected
                 } else if (bonded.isEmpty()) {
@@ -1654,7 +1772,7 @@ public class MainActivity extends Activity {
                         if (ssid.startsWith("\"") && ssid.endsWith("\"") && ssid.length() >= 2) {
                             ssid = ssid.substring(1, ssid.length() - 1);
                         }
-                        if (ssid.length() > 18) ssid = ssid.substring(0, 17) + "\u2026";
+                        if (ssid.length() > 14) ssid = ssid.substring(0, 13) + "\u2026";
                         name = ssid;
                     }
                 }
