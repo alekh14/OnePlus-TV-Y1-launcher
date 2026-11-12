@@ -10,4 +10,5 @@ final class AppEntry {
     ComponentName component;
     Drawable tile;   // rounded 16:9 tile (banner, or icon on a dark plate)
     int glow;        // colour sampled from the banner/icon, used for the ambient glow
+    boolean isPhoto; // the live photo tile (not a real app)
 }
