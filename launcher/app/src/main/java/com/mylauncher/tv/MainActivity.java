@@ -89,7 +89,7 @@ public class MainActivity extends Activity {
             "in.startv.hotstar.dplus.tv"
     };
     private static final int COLS = 4;
-    private static final int MAX_DOCK = 8, DOCK_VISIBLE = 4;
+    private static final int MAX_DOCK = 8, DOCK_COLS = 4, DOCK_GAP_U = 14;
 
     private static final int Z_TOP = 0, Z_DOCK = 1, Z_GRID = 2, Z_MENU = 3;
     private static final int P_SWITCH = 0, P_INPUTS = 1, P_BT = 2, P_WIFI = 3, P_SETTINGS = 4;
@@ -97,7 +97,7 @@ public class MainActivity extends Activity {
     // ---- geometry ----
     private float u;
     private int W, H;
-    private int margin, cellW, tileW, tileH, bandTop, bandH, shiftPx;
+    private int margin, cellW, tileW, tileH, bandTop, bandH, dockGap, shiftPx;
 
     // ---- views ----
     private FrameLayout root, page;
@@ -108,8 +108,7 @@ public class MainActivity extends Activity {
     private LinearLayout topBar;
     private IconDrawable wifiIcon, btIcon, gearIcon, gridIcon, dockIcon;
     private boolean allTab = false;      // false: dock tab, true: all-applications tab
-    private int dockOffset = 0;           // first dock app that is visible (the dock shows 4 of up to 8)
-    private TextView dockInfo;
+    private final List<View> dockExtras = new ArrayList<>();   // labels drawn on live dock tiles
     private int iconPx;
     private View dockBand;
     private final List<ImageView> dockTiles = new ArrayList<>();
@@ -154,8 +153,7 @@ public class MainActivity extends Activity {
                 show = gridLm != null && !grid.isEmpty() && grid.get(0) == photoEntry
                         && gridLm.findFirstVisibleItemPosition() == 0;
             } else {
-                int pi = dock.indexOf(photoEntry);
-                show = pi >= dockOffset && pi < dockOffset + DOCK_VISIBLE;
+                show = dock.contains(photoEntry);
             }
             if (show) photoTile.next();
             ui.postDelayed(this, 8000);
@@ -370,8 +368,9 @@ public class MainActivity extends Activity {
         cellW = (W - 2 * margin) / COLS;
         tileW = cellW - (int) px(24);
         tileH = tileW * 9 / 16;
-        bandH = tileH + (int) px(28);
-        bandTop = H - bandH - (int) px(28);
+        dockGap = (int) px(DOCK_GAP_U);
+        bandH = 2 * tileH + 3 * dockGap;            // the dock is a grid: 4 columns x 2 rows (8 apps)
+        bandTop = H - bandH - (int) px(22);
         shiftPx = 0;   // the page no longer slides: the grid lives on its own tab
     }
 
@@ -499,10 +498,6 @@ public class MainActivity extends Activity {
         dockBand.setBackground(band);
         page.addView(dockBand, lp(W - 2 * margin, bandH, margin, bandTop));
 
-        dockInfo = text(13, 0x99FFFFFF, fRegular);
-        dockInfo.setGravity(Gravity.CENTER);
-        dockInfo.setVisibility(View.GONE);
-        page.addView(dockInfo, lp(W - 2 * margin, ViewGroup.LayoutParams.WRAP_CONTENT, margin, bandTop + bandH + (int) px(6)));
 
         // ---- all-applications grid (its own tab, below the clock) ----
         int gridTop = (int) px(170);
@@ -597,7 +592,8 @@ public class MainActivity extends Activity {
                     String lastBase = prefs.getString("dockBase", null);
                     String custom = prefs.getString("dockCustom", null);
                     String use;
-                    if (custom != null && base.equals(lastBase)) {
+                    final boolean isCustom = custom != null && base.equals(lastBase);
+                    if (isCustom) {
                         use = custom;
                     } else {
                         use = base;
@@ -616,8 +612,9 @@ public class MainActivity extends Activity {
                         }
                         if (dockList.size() >= MAX_DOCK) break;
                     }
-                    final List<AppEntry> gridList = new ArrayList<>(list);
-                    gridList.removeAll(dockList);
+                    // default dock (not edited on the remote): the live photo tile joins it like a Windows live tile
+                    if (!isCustom && !dockList.contains(photoEntry) && dockList.size() < MAX_DOCK) dockList.add(photoEntry);
+                    final List<AppEntry> gridList = new ArrayList<>(list);   // All apps: every app, dock ones too
                     if (!dockList.contains(photoEntry)) gridList.add(0, photoEntry);
                     ui.post(new Runnable() {
                         @Override public void run() { onAppsLoaded(dockList, gridList, keepPkg); }
@@ -723,44 +720,55 @@ public class MainActivity extends Activity {
 
     private void buildDockTiles() {
         for (ImageView v : dockTiles) page.removeView(v);
+        for (View v : dockExtras) page.removeView(v);
         dockTiles.clear();
-        int top = bandTop + (bandH - tileH) / 2;
+        dockExtras.clear();
         int glassIndex = page.indexOfChild(glass);
         for (int i = 0; i < dock.size(); i++) {
+            AppEntry a = dock.get(i);
             ImageView iv = new ImageView(this);
             iv.setScaleType(ImageView.ScaleType.FIT_XY);
-            iv.setImageDrawable(dock.get(i).tile);
+            iv.setImageDrawable(a.tile);
             iv.setFocusable(false);
-            int left = margin + (cellW - tileW) / 2;   // slot 0; layoutDock() shifts the others
-            page.addView(iv, glassIndex + i, lp(tileW, tileH, left, top));
+            int left = margin + (cellW - tileW) / 2;   // slot 0; layoutDock() moves it to its column and row
+            int top = bandTop + dockGap;
+            page.addView(iv, glassIndex + dockTiles.size() + dockExtras.size(), lp(tileW, tileH, left, top));
             dockTiles.add(iv);
+            if (a.isPhoto) {
+                // Windows-style live tile: name in the corner of the tile
+                TextView t = text(13, Color.WHITE, fRegular);
+                t.setText(a.label);
+                t.setPadding((int) px(8), (int) px(3), (int) px(8), (int) px(3));
+                GradientDrawable tb = new GradientDrawable();
+                tb.setColor(0x88000000);
+                tb.setCornerRadius(px(8));
+                t.setBackground(tb);
+                page.addView(t, glassIndex + dockTiles.size() + dockExtras.size(),
+                        lp(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                                left + (int) px(8), top + tileH - (int) px(30)));
+                dockExtras.add(t);
+                iv.setTag(t);
+            }
         }
         layoutDock();
     }
 
-    /** Keep the focused dock app inside the 4 visible slots. */
-    private void ensureDockVisible() {
-        int maxOff = Math.max(0, dock.size() - DOCK_VISIBLE);
-        if (dockIdx < dockOffset) dockOffset = dockIdx;
-        if (dockIdx >= dockOffset + DOCK_VISIBLE) dockOffset = dockIdx - DOCK_VISIBLE + 1;
-        dockOffset = clamp(dockOffset, 0, maxOff);
-    }
-
-    /** Slide dock tiles into the visible slots; the others are hidden. */
+    /** Put dock tile i in its column and row (4 x 2). Hidden while the All apps tab is shown. */
     private void layoutDock() {
-        ensureDockVisible();
         for (int i = 0; i < dockTiles.size(); i++) {
             ImageView v = dockTiles.get(i);
-            int slot = i - dockOffset;
-            v.setTranslationX(slot * cellW);
-            v.setVisibility(!allTab && slot >= 0 && slot < DOCK_VISIBLE ? View.VISIBLE : View.INVISIBLE);
-        }
-        if (dock.size() > DOCK_VISIBLE) {
-            dockInfo.setText((dockOffset > 0 ? "\u2039   " : "     ") + (dockIdx + 1) + " / " + dock.size()
-                    + (dockOffset + DOCK_VISIBLE < dock.size() ? "   \u203A" : "     "));
-            dockInfo.setVisibility(allTab ? View.GONE : View.VISIBLE);
-        } else {
-            dockInfo.setVisibility(View.GONE);
+            float tx = (i % DOCK_COLS) * cellW;
+            float ty = (i / DOCK_COLS) * (tileH + dockGap);
+            v.setTranslationX(tx);
+            v.setTranslationY(ty);
+            v.setVisibility(allTab ? View.INVISIBLE : View.VISIBLE);
+            Object t = v.getTag();
+            if (t instanceof View) {
+                View lab = (View) t;
+                lab.setTranslationX(tx);
+                lab.setTranslationY(ty);
+                lab.setVisibility(allTab ? View.INVISIBLE : View.VISIBLE);
+            }
         }
     }
 
@@ -786,6 +794,12 @@ public class MainActivity extends Activity {
     private void launch(AppEntry e) {
         if (e == null) return;
         if (e.isPhoto) {
+            if (Build.VERSION.SDK_INT >= 23
+                    && checkSelfPermission(Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
+                toast("Allow access to your photos");
+                requestPermissions(new String[]{Manifest.permission.READ_EXTERNAL_STORAGE}, 78);
+                return;
+            }
             if (photoTile.hasPhotos()) photoTile.next();
             else toast("No photos yet. See the README to add some.");
             return;
@@ -876,14 +890,20 @@ public class MainActivity extends Activity {
                 break;
             case Z_DOCK:
                 if (dx != 0) {
-                    dockIdx = clamp(dockIdx + dx, 0, Math.max(0, dock.size() - 1));
-                    layoutDock();
+                    int col = dockIdx % DOCK_COLS;
+                    int nc = col + dx;
+                    int ni = dockIdx + dx;
+                    if (nc >= 0 && nc < DOCK_COLS && ni >= 0 && ni < dock.size()) dockIdx = ni;
                 } else if (dy < 0) {
-                    zone = Z_TOP;
-                } else if (dy > 0 && !grid.isEmpty()) {
-                    gridIdx = Math.min(dockIdx - dockOffset, grid.size() - 1);   // same column, first row
-                    setTab(true, Z_GRID);
-                    return;
+                    if (dockIdx >= DOCK_COLS) dockIdx -= DOCK_COLS; else zone = Z_TOP;
+                } else if (dy > 0) {
+                    int n = dockIdx + DOCK_COLS;
+                    if (n < dock.size()) {
+                        dockIdx = n;
+                    } else {
+                        int lastRowStart = ((dock.size() - 1) / DOCK_COLS) * DOCK_COLS;
+                        if (dockIdx < lastRowStart) dockIdx = dock.size() - 1;   // short last row
+                    }
                 }
                 break;
             case Z_GRID:
@@ -1288,7 +1308,19 @@ public class MainActivity extends Activity {
         addMenuRow(e.isPhoto ? "Next photo" : "Open", true, new Runnable() {
             @Override public void run() { closeMenu(); launch(e); }
         });
-        if (!inDock) {
+        if (!inDock && dock.contains(e)) {
+            if (dock.size() > 1) {
+                addMenuRow("Remove from dock", true, new Runnable() {
+                    @Override public void run() {
+                        closeMenu();
+                        List<String> l = dockPkgs();
+                        l.remove(e.pkg);
+                        saveDock(l, Math.min(dockIdx, l.size() - 1));
+                        toast(e.label + " removed from the dock");
+                    }
+                });
+            }
+        } else if (!inDock) {
             if (dock.size() < MAX_DOCK) {
                 addMenuRow("Add to dock", true, new Runnable() {
                     @Override public void run() {
@@ -1628,6 +1660,16 @@ public class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+        if (requestCode == 78) {
+            boolean ok = grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED;
+            if (ok) {
+                photoTile.refresh();
+                toast(photoTile.hasPhotos() ? "Photos allowed" : "Allowed. Now copy photos to /sdcard/Pictures/TVHome");
+            } else {
+                toast("Photo access denied");
+            }
+            return;
+        }
         if (requestCode != 77) return;
         if (btHasPermission()) {
             if (btMenu) startScan();
